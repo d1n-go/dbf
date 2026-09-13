@@ -1,4 +1,4 @@
-module github.com/demen1n/dbf
+module github.com/d1n-go/dbf
 
 go 1.25
 

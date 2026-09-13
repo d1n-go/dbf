@@ -1,10 +1,10 @@
 # DBF Reader
 
-[![CI](https://github.com/demen1n/dbf/actions/workflows/ci.yml/badge.svg)](https://github.com/demen1n/dbf/actions/workflows/ci.yml)
-[![Coverage](https://codecov.io/gh/demen1n/dbf/graph/badge.svg)](https://codecov.io/gh/demen1n/dbf)
-[![Go Reference](https://pkg.go.dev/badge/github.com/demen1n/dbf.svg)](https://pkg.go.dev/github.com/demen1n/dbf)
-[![Release](https://img.shields.io/github/v/release/demen1n/dbf)](https://github.com/demen1n/dbf/releases)
-[![License: MIT](https://img.shields.io/github/license/demen1n/dbf)](LICENSE)
+[![CI](https://github.com/d1n-go/dbf/actions/workflows/ci.yml/badge.svg)](https://github.com/d1n-go/dbf/actions/workflows/ci.yml)
+[![Coverage](https://codecov.io/gh/d1n-go/dbf/graph/badge.svg)](https://codecov.io/gh/d1n-go/dbf)
+[![Go Reference](https://pkg.go.dev/badge/github.com/d1n-go/dbf.svg)](https://pkg.go.dev/github.com/d1n-go/dbf)
+[![Release](https://img.shields.io/github/v/release/d1n-go/dbf)](https://github.com/d1n-go/dbf/releases)
+[![License: MIT](https://img.shields.io/github/license/d1n-go/dbf)](LICENSE)
 
 A pure Go library for reading DBF (dBase, FoxPro, Visual FoxPro) files with support for multiple encodings.
 
@@ -20,7 +20,7 @@ A pure Go library for reading DBF (dBase, FoxPro, Visual FoxPro) files with supp
 ## Installation
 
 ```bash
-go get github.com/demen1n/dbf
+go get github.com/d1n-go/dbf
 ```
 
 ## Quick Start
@@ -32,7 +32,7 @@ import (
     "fmt"
     "log"
     
-    "github.com/demen1n/dbf"
+    "github.com/d1n-go/dbf"
 )
 
 func main() {
@@ -186,7 +186,7 @@ date, _ := time.Parse("20060102", record.Data["BIRTHDATE"])
 
 ## API Documentation
 
-Full API documentation is available at [pkg.go.dev](https://pkg.go.dev/github.com/demen1n/dbf).
+Full API documentation is available at [pkg.go.dev](https://pkg.go.dev/github.com/d1n-go/dbf).
 
 ## Testing
 
