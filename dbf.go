@@ -598,6 +598,10 @@ func (r *Reader) Read() (*Record, error) {
 	return record, nil
 }
 
+// maxInitialCap limits the initial ReadAll allocation so that a malicious
+// records count in the header cannot cause a huge preallocation.
+const maxInitialCap = 1 << 20
+
 // ReadAll reads all records from the DBF file into memory.
 // This is convenient for small files but may consume significant memory for large files.
 // For large files, consider using Next()/Read() for streaming access.
@@ -611,14 +615,9 @@ func (r *Reader) Read() (*Record, error) {
 //	for _, record := range records {
 //		fmt.Println(record.Data["NAME"])
 //	}
-const maxInitialCap = 1 << 20 // 1M records initial cap limit
-
 func (r *Reader) ReadAll() ([]*Record, error) {
-	cap := r.recordsCount
-	if cap > maxInitialCap {
-		cap = maxInitialCap
-	}
-	records := make([]*Record, 0, cap)
+	capacity := min(r.recordsCount, maxInitialCap)
+	records := make([]*Record, 0, capacity)
 
 	for r.Next() {
 		record, err := r.Read()
@@ -681,6 +680,8 @@ func (r *Reader) decodeFieldValue(field Field, data []byte) (string, error) {
 	}
 }
 
+// Close closes the underlying file if the Reader was created with NewFromFile.
+// It is a no-op for readers created with New. Close is safe to call multiple times.
 func (r *Reader) Close() error {
 	if r.file != nil {
 		err := r.file.Close()
