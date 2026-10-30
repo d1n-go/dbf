@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -1095,21 +1096,142 @@ func TestCloseWithoutFile(t *testing.T) {
 	}
 }
 
-func TestErrAfterIOEOF(t *testing.T) {
+func TestErrAfterTruncation(t *testing.T) {
 	data := createMinimalDBF()
-	// truncate one record to force io.EOF mid-read
-	truncated := data[:len(data)-5]
-	r, err := New(bytes.NewReader(truncated), WithCP866())
+	tests := []struct {
+		name    string
+		cut     int // bytes removed from the end
+		wantErr error
+	}{
+		{"inside record", 5, io.ErrUnexpectedEOF},
+		{"at record boundary", 11, io.EOF},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, err := New(bytes.NewReader(data[:len(data)-tt.cut]), WithCP866())
+			if err != nil {
+				t.Fatalf("New() failed: %v", err)
+			}
+			count := 0
+			for r.Next() {
+				if _, err := r.Read(); err != nil {
+					t.Fatalf("Read() failed: %v", err)
+				}
+				count++
+			}
+			if count != 1 {
+				t.Errorf("read %d records, want 1", count)
+			}
+			err = r.Err()
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("Err() = %v, want wrapped %v", err, tt.wantErr)
+			}
+			if err == tt.wantErr {
+				t.Error("Err() must wrap the I/O error with context")
+			}
+			if _, err := r.Read(); err == nil {
+				t.Error("Read() after failed Next() should return an error")
+			}
+		})
+	}
+}
+
+func TestNextTwiceSkipsRecord(t *testing.T) {
+	r, err := New(bytes.NewReader(createMinimalDBF()), WithCP866())
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
-	// exhaust records — second Read will hit EOF
-	for r.Next() {
-		r.Read() //nolint
+	if !r.Next() || !r.Next() {
+		t.Fatal("Next() returned false")
 	}
-	// err() must not expose io.EOF
-	if err := r.Err(); err != nil && err.Error() == "EOF" {
-		t.Error("Err() must not return raw io.EOF")
+	record, err := r.Read()
+	if err != nil {
+		t.Fatalf("Read() failed: %v", err)
+	}
+	if got := record.Data["NAME"]; got != "Jane Smith" {
+		t.Errorf("Read() after two Next() = %q, want %q", got, "Jane Smith")
+	}
+	if r.Next() {
+		t.Error("Next() should return false after the last record")
+	}
+	if _, err := r.Read(); !errors.Is(err, ErrReadBeforeNext) {
+		t.Errorf("Read() after Next() returned false: got %v, want ErrReadBeforeNext", err)
+	}
+	if err := r.Err(); err != nil {
+		t.Errorf("Err() = %v, want nil", err)
+	}
+}
+
+func TestReadTwiceAfterNext(t *testing.T) {
+	r, err := New(bytes.NewReader(createMinimalDBF()), WithCP866())
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	if !r.Next() {
+		t.Fatal("Next() returned false")
+	}
+	if _, err := r.Read(); err != nil {
+		t.Fatalf("Read() failed: %v", err)
+	}
+	if _, err := r.Read(); !errors.Is(err, ErrReadBeforeNext) {
+		t.Errorf("second Read() = %v, want ErrReadBeforeNext", err)
+	}
+}
+
+func TestReadAllAfterNext(t *testing.T) {
+	r, err := New(bytes.NewReader(createMinimalDBF()), WithCP866())
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	if !r.Next() {
+		t.Fatal("Next() returned false")
+	}
+	records, err := r.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll() failed: %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("ReadAll() returned %d records, want 2", len(records))
+	}
+	if records[0].Data["NAME"] != "John Doe" || records[1].Data["NAME"] != "Jane Smith" {
+		t.Errorf("ReadAll() returned wrong records: %v, %v", records[0].Data, records[1].Data)
+	}
+}
+
+func TestReadAllAfterRead(t *testing.T) {
+	r, err := New(bytes.NewReader(createMinimalDBF()), WithCP866())
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	if !r.Next() {
+		t.Fatal("Next() returned false")
+	}
+	if _, err := r.Read(); err != nil {
+		t.Fatalf("Read() failed: %v", err)
+	}
+	records, err := r.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll() failed: %v", err)
+	}
+	if len(records) != 1 || records[0].Data["NAME"] != "Jane Smith" {
+		t.Errorf("ReadAll() after Read() = %d records, want only Jane Smith", len(records))
+	}
+}
+
+func TestNextWithoutReadNoError(t *testing.T) {
+	r, err := New(bytes.NewReader(createMinimalDBF()), WithCP866())
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	count := 0
+	for r.Next() {
+		count++
+	}
+	if count != 2 {
+		t.Errorf("Next() returned true %d times, want 2", count)
+	}
+	if err := r.Err(); err != nil {
+		t.Errorf("Err() = %v, want nil", err)
 	}
 }
 

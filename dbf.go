@@ -175,8 +175,9 @@ type Reader struct {
 
 	decoder       *encoding.Decoder
 	reader        *bufio.Reader
-	currentRecord uint32 // number of records advanced by Next()
-	pending       bool   // next() was called and Read() has not yet consumed the record
+	currentRecord uint32 // number of records consumed from the input by Next()
+	pending       bool   // Next() loaded a record into buf that Read() has not yet returned
+	buf           []byte // raw bytes of the record loaded by Next()
 	err           error  // last error during reading
 
 	file *os.File
@@ -525,9 +526,12 @@ type Record struct {
 	Data    map[string]string // field values indexed by field name
 }
 
-// Next advances to the next record in the DBF file.
-// It returns false when there are no more records or an error occurred.
-// Use Err() to check for errors after the iteration completes.
+// Next advances to the next record in the DBF file, reading its raw bytes
+// from the input. It returns false when there are no more records or an
+// error occurred. Use Err() to check for errors after the iteration completes.
+//
+// Each successful Next makes exactly one record available to Read. Calling
+// Next again without Read skips the loaded record.
 //
 // Example:
 //
@@ -542,7 +546,16 @@ type Record struct {
 //		log.Fatal(err)
 //	}
 func (r *Reader) Next() bool {
+	r.pending = false
 	if r.err != nil || r.currentRecord >= r.recordsCount {
+		return false
+	}
+
+	if r.buf == nil {
+		r.buf = make([]byte, r.recordBytesNumber)
+	}
+	if _, err := io.ReadFull(r.reader, r.buf); err != nil {
+		r.err = fmt.Errorf("read record %d: %w", r.currentRecord, err)
 		return false
 	}
 
@@ -551,8 +564,9 @@ func (r *Reader) Next() bool {
 	return true
 }
 
-// Read reads the current record. Must be called after a successful Next() call.
-// Returns an error if reading fails or if called without a prior Next() call.
+// Read decodes the record loaded by the preceding successful Next() call.
+// It returns ErrReadBeforeNext if there is no such record: Next() was not
+// called, returned false, or its record has already been returned by Read().
 func (r *Reader) Read() (*Record, error) {
 	if r.err != nil {
 		return nil, r.err
@@ -562,13 +576,7 @@ func (r *Reader) Read() (*Record, error) {
 	}
 	r.pending = false
 
-	// read the entire record
-	recordBytes := make([]byte, r.recordBytesNumber)
-	if _, err := io.ReadFull(r.reader, recordBytes); err != nil {
-		r.err = fmt.Errorf("read record bytes: %w", err)
-		return nil, r.err
-	}
-
+	recordBytes := r.buf
 	record := &Record{
 		Deleted: recordBytes[0] == 0x2A, // '*' marks deleted records
 		Data:    make(map[string]string, len(r.fields)),
@@ -602,7 +610,9 @@ func (r *Reader) Read() (*Record, error) {
 // records count in the header cannot cause a huge preallocation.
 const maxInitialCap = 1 << 20
 
-// ReadAll reads all records from the DBF file into memory.
+// ReadAll reads all remaining records from the DBF file into memory.
+// If Next() has loaded a record that has not been returned by Read() yet,
+// that record is included as the first element.
 // This is convenient for small files but may consume significant memory for large files.
 // For large files, consider using Next()/Read() for streaming access.
 //
@@ -616,8 +626,19 @@ const maxInitialCap = 1 << 20
 //		fmt.Println(record.Data["NAME"])
 //	}
 func (r *Reader) ReadAll() ([]*Record, error) {
-	capacity := min(r.recordsCount, maxInitialCap)
+	capacity := min(r.recordsCount-r.currentRecord, maxInitialCap)
+	if r.pending {
+		capacity++
+	}
 	records := make([]*Record, 0, capacity)
+
+	if r.pending {
+		record, err := r.Read()
+		if err != nil {
+			return records, err
+		}
+		records = append(records, record)
+	}
 
 	for r.Next() {
 		record, err := r.Read()
