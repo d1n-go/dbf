@@ -171,7 +171,6 @@ type Reader struct {
 	recordsCount      uint32
 	headerBytesNumber uint16
 	recordBytesNumber uint16
-	fieldsCount       uint16
 	fields            []Field
 
 	decoder       *encoding.Decoder
@@ -353,7 +352,6 @@ func (r *Reader) readMetadata() error {
 	if r.headerBytesNumber < metadataLength {
 		return fmt.Errorf("%w: %d (must be >= %d)", ErrInvalidHeaderSize, r.headerBytesNumber, metadataLength)
 	}
-	r.fieldsCount = (r.headerBytesNumber - metadataLength) / fieldLength
 
 	// read record size (2 bytes, little-endian)
 	recordBytes := make([]byte, 2)
@@ -384,7 +382,8 @@ func (r *Reader) readMetadata() error {
 // readFields reads field descriptors until the 0x0D terminator, then skips
 // any remaining header padding so the reader is positioned at the first record.
 func (r *Reader) readFields() error {
-	r.fields = make([]Field, 0, r.fieldsCount)
+	// header size gives an upper bound on the number of descriptors
+	r.fields = make([]Field, 0, (r.headerBytesNumber-metadataLength)/fieldLength)
 
 	for {
 		b, err := r.reader.ReadByte()
@@ -514,7 +513,7 @@ func (r *Reader) String() string {
 		r.fileType,
 		r.lastUpdate.Format("2006-01-02"),
 		r.recordsCount,
-		r.fieldsCount,
+		len(r.fields),
 		r.headerBytesNumber,
 		r.recordBytesNumber,
 	)

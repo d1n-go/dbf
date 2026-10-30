@@ -888,6 +888,44 @@ func TestHeaderPaddingSkip(t *testing.T) {
 	}
 }
 
+func TestStringFieldsCountWithPadding(t *testing.T) {
+	for _, padding := range []int{0, 10, 32, 263} {
+		buf := new(bytes.Buffer)
+		buf.WriteByte(0x03)
+		buf.WriteByte(124)
+		buf.WriteByte(1)
+		buf.WriteByte(15)
+		binary.Write(buf, binary.LittleEndian, uint32(0))
+		binary.Write(buf, binary.LittleEndian, uint16(32+32+1+padding))
+		binary.Write(buf, binary.LittleEndian, uint16(1+5))
+		reserved := make([]byte, 20)
+		reserved[17] = 0x26
+		buf.Write(reserved)
+
+		name := make([]byte, 11)
+		copy(name, "ID")
+		buf.Write(name)
+		buf.WriteByte('C')
+		buf.Write(make([]byte, 4))
+		buf.WriteByte(5)
+		buf.WriteByte(0)
+		buf.Write(make([]byte, 14))
+		buf.WriteByte(0x0D)
+		buf.Write(make([]byte, padding))
+
+		r, err := New(bytes.NewReader(buf.Bytes()))
+		if err != nil {
+			t.Fatalf("padding %d: New() failed: %v", padding, err)
+		}
+		if r.FieldsCount() != 1 {
+			t.Errorf("padding %d: FieldsCount() = %d, want 1", padding, r.FieldsCount())
+		}
+		if !strings.Contains(r.String(), "Fields Count: 1\n") {
+			t.Errorf("padding %d: String() reports wrong fields count:\n%s", padding, r.String())
+		}
+	}
+}
+
 func TestGetDecoderByLDID(t *testing.T) {
 	tests := []struct {
 		ldid byte
