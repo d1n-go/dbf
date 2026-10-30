@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -296,9 +297,10 @@ func (r *Reader) RecordsCount() uint32 {
 	return r.recordsCount
 }
 
-// Fields returns the field definitions for the DBF table.
+// Fields returns a copy of the field definitions for the DBF table.
+// Modifying the returned slice does not affect the Reader.
 func (r *Reader) Fields() []Field {
-	return r.fields
+	return slices.Clone(r.fields)
 }
 
 // FieldsCount returns the number of fields in the DBF table.

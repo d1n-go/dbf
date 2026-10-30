@@ -262,6 +262,35 @@ func TestFields(t *testing.T) {
 	}
 }
 
+func TestFieldsReturnsCopy(t *testing.T) {
+	r, err := New(bytes.NewReader(createDBFWithMultipleFields()), WithCP866())
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	fields := r.Fields()
+	fields[0].Name = "MUTATED"
+	fields[0].Length = 1
+
+	if got := r.Fields()[0]; got.Name != "NAME" || got.Length != 10 {
+		t.Errorf("Fields() exposed internal state: got %+v", got)
+	}
+
+	if !r.Next() {
+		t.Fatal("Next() returned false")
+	}
+	record, err := r.Read()
+	if err != nil {
+		t.Fatalf("Read() failed: %v", err)
+	}
+	if _, ok := record.Data["MUTATED"]; ok {
+		t.Error("record contains mutated field name")
+	}
+	if _, ok := record.Data["NAME"]; !ok {
+		t.Error("record is missing NAME field")
+	}
+}
+
 func TestFieldTypeString(t *testing.T) {
 	tests := []struct {
 		fieldType byte
