@@ -860,10 +860,35 @@ func TestHeaderPaddingSkip(t *testing.T) {
 }
 
 func TestGetDecoderByLDID(t *testing.T) {
-	ldids := []byte{0x26, 0x64, 0x65, 0xC9, 0x03, 0x01, 0x02}
-	for _, ldid := range ldids {
-		if getDecoderByLDID(ldid) == nil {
-			t.Errorf("getDecoderByLDID(0x%02X) returned nil, want decoder", ldid)
+	tests := []struct {
+		ldid byte
+		cm   *charmap.Charmap
+		text string
+	}{
+		{0x26, charmap.CodePage866, "Привет"},
+		{0x65, charmap.CodePage866, "Привет"},
+		{0x64, charmap.CodePage852, "Łódź"},
+		{0xC9, charmap.Windows1251, "Привет"},
+		{0x03, charmap.Windows1252, "Café"},
+		{0x01, charmap.CodePage437, "Café"},
+		{0x02, charmap.CodePage850, "Café"},
+	}
+	for _, tt := range tests {
+		dec := getDecoderByLDID(tt.ldid)
+		if dec == nil {
+			t.Errorf("getDecoderByLDID(0x%02X) returned nil, want decoder", tt.ldid)
+			continue
+		}
+		encoded, err := tt.cm.NewEncoder().Bytes([]byte(tt.text))
+		if err != nil {
+			t.Fatalf("encode %q: %v", tt.text, err)
+		}
+		decoded, err := dec.Bytes(encoded)
+		if err != nil {
+			t.Fatalf("getDecoderByLDID(0x%02X) decode: %v", tt.ldid, err)
+		}
+		if string(decoded) != tt.text {
+			t.Errorf("getDecoderByLDID(0x%02X) decoded %q, want %q", tt.ldid, decoded, tt.text)
 		}
 	}
 	if getDecoderByLDID(0xFF) != nil {

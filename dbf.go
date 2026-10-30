@@ -482,9 +482,11 @@ func isValidFileType(ft FileType) bool {
 // Returns nil if the Language Driver ID is not recognized.
 func getDecoderByLDID(ldid byte) *encoding.Decoder {
 	switch ldid {
-	case 0x26: // CP866 (Russian MS-DOS)
+	case 0x26, 0x65: // CP866 (Russian MS-DOS)
 		return charmap.CodePage866.NewDecoder()
-	case 0x64, 0x65, 0xC9: // CP1251 (Russian Windows)
+	case 0x64: // CP852 (Eastern European MS-DOS)
+		return charmap.CodePage852.NewDecoder()
+	case 0xC9: // CP1251 (Russian Windows)
 		return charmap.Windows1251.NewDecoder()
 	case 0x03: // CP1252 (Windows ANSI)
 		return charmap.Windows1252.NewDecoder()

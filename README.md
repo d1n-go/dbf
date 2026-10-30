@@ -12,7 +12,7 @@ A pure Go library for reading DBF (dBase, FoxPro, Visual FoxPro) files with supp
 
 - ✅ Read DBF files in various formats (dBase III, FoxPro, Visual FoxPro)
 - ✅ Automatic encoding detection from Language Driver ID
-- ✅ Support for multiple encodings (CP866, CP1251, CP1252, CP437, CP850)
+- ✅ Support for multiple encodings (CP866, CP1251, CP1252, CP437, CP850, CP852)
 - ✅ Memory-efficient streaming for large files
 - ✅ Simple, idiomatic Go API
 - ✅ No external dependencies except `golang.org/x/text`
@@ -157,8 +157,9 @@ The library automatically detects these encodings from Language Driver ID:
 
 | LDID   | Encoding | Description |
 |--------|----------|-------------|
-| 0x26   | CP866    | Russian MS-DOS |
-| 0x64, 0x65, 0xC9 | CP1251 | Russian Windows |
+| 0x26, 0x65 | CP866 | Russian MS-DOS |
+| 0x64   | CP852    | Eastern European MS-DOS |
+| 0xC9   | CP1251   | Russian Windows |
 | 0x03   | CP1252   | Windows ANSI |
 | 0x01   | CP437    | US MS-DOS |
 | 0x02   | CP850    | International MS-DOS |
