@@ -518,27 +518,131 @@ func TestEncodingAutodetectionFails(t *testing.T) {
 	}
 }
 
+// writeHeader writes a 32-byte dBase III header with CP866 LDID.
+func writeHeader(buf *bytes.Buffer, records uint32, headerSize, recordSize uint16) {
+	buf.WriteByte(0x03)
+	buf.Write([]byte{124, 1, 15})
+	binary.Write(buf, binary.LittleEndian, records)
+	binary.Write(buf, binary.LittleEndian, headerSize)
+	binary.Write(buf, binary.LittleEndian, recordSize)
+	reserved := make([]byte, 20)
+	reserved[17] = 0x26
+	buf.Write(reserved)
+}
+
+// writeCharField writes a 32-byte descriptor for a C field.
+func writeCharField(buf *bytes.Buffer, name string, length byte) {
+	b := make([]byte, 32)
+	copy(b, name)
+	b[11] = 'C'
+	b[16] = length
+	buf.Write(b)
+}
+
 func TestInvalidTerminator(t *testing.T) {
 	buf := new(bytes.Buffer)
-
-	// valid header
-	buf.WriteByte(0x03)
-	buf.Write(make([]byte, 10))
-	binary.Write(buf, binary.LittleEndian, uint32(0)) // 0 records
-	binary.Write(buf, binary.LittleEndian, uint16(32+32+1))
-	binary.Write(buf, binary.LittleEndian, uint16(11))
-	buf.Write(make([]byte, 20))
-
-	// field descriptor
-	buf.Write(make([]byte, 32))
-
-	// invalid terminator (should be 0x0D)
-	buf.WriteByte(0xFF)
+	writeHeader(buf, 0, 32+32+1, 1+10)
+	writeCharField(buf, "NAME", 10)
+	buf.WriteByte(0xFF) // should be 0x0D
 
 	_, err := New(bytes.NewReader(buf.Bytes()))
-	if err == nil {
-		t.Error("Expected error for invalid terminator, got nil")
+	if !errors.Is(err, ErrInvalidTerminator) {
+		t.Errorf("New() = %v, want ErrInvalidTerminator", err)
 	}
+}
+
+func TestHeaderTooSmallForTerminator(t *testing.T) {
+	buf := new(bytes.Buffer)
+	writeHeader(buf, 0, 32, 1+10)
+	writeCharField(buf, "NAME", 10)
+	buf.WriteByte(0x0D)
+
+	_, err := New(bytes.NewReader(buf.Bytes()))
+	if !errors.Is(err, ErrInvalidHeaderSize) {
+		t.Errorf("New() = %v, want ErrInvalidHeaderSize", err)
+	}
+}
+
+func TestFieldDescriptorExceedsHeader(t *testing.T) {
+	// header declares room for one descriptor without the terminator
+	buf := new(bytes.Buffer)
+	writeHeader(buf, 0, 32+32, 1+10)
+	writeCharField(buf, "NAME", 10)
+	buf.WriteByte(0x0D)
+
+	_, err := New(bytes.NewReader(buf.Bytes()))
+	if !errors.Is(err, ErrInvalidTerminator) {
+		t.Errorf("New() = %v, want ErrInvalidTerminator", err)
+	}
+}
+
+func TestZeroLengthFieldsOutsideHeader(t *testing.T) {
+	// 2048 zero-length descriptors after a header that declares no fields
+	buf := new(bytes.Buffer)
+	writeHeader(buf, 0, 33, 1)
+	buf.Write(make([]byte, 2048*32))
+	buf.WriteByte(0x0D)
+
+	r, err := New(bytes.NewReader(buf.Bytes()))
+	if !errors.Is(err, ErrInvalidTerminator) {
+		t.Errorf("New() = %v, want ErrInvalidTerminator", err)
+	}
+	if r != nil {
+		t.Errorf("New() returned reader with %d fields", r.FieldsCount())
+	}
+}
+
+// countingReader counts bytes read from the underlying reader.
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
+}
+
+func TestNewDoesNotReadPastHeader(t *testing.T) {
+	// a stream of descriptors without a terminator must not be consumed to EOF
+	const headerSize = 32 + 32 + 1
+	buf := new(bytes.Buffer)
+	writeHeader(buf, 0, headerSize, 1+10)
+	for buf.Len() < 1<<20 {
+		writeCharField(buf, "NAME", 10)
+	}
+
+	cr := &countingReader{r: bytes.NewReader(buf.Bytes())}
+	if _, err := New(cr); !errors.Is(err, ErrInvalidTerminator) {
+		t.Fatalf("New() = %v, want ErrInvalidTerminator", err)
+	}
+	// allow for bufio read-ahead
+	if limit := headerSize + 4096; cr.n > limit {
+		t.Errorf("New() read %d bytes, want <= %d", cr.n, limit)
+	}
+}
+
+func FuzzNew(f *testing.F) {
+	f.Add(createMinimalDBF())
+	f.Add(createDBFWithMultipleFields())
+	f.Add(createVFPDBFWithLongCharField(300))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 1<<16 {
+			return
+		}
+		r, err := New(bytes.NewReader(data), WithCP866())
+		if err != nil {
+			return
+		}
+		if max := (int(r.headerBytesNumber) - 33) / 32; r.FieldsCount() > max {
+			t.Fatalf("%d fields do not fit in %d-byte header", r.FieldsCount(), r.headerBytesNumber)
+		}
+		records, err := r.ReadAll()
+		if err == nil && uint32(len(records)) != r.RecordsCount() {
+			t.Fatalf("ReadAll() returned %d records without error, header declares %d", len(records), r.RecordsCount())
+		}
+	})
 }
 
 func TestEmptyFile(t *testing.T) {
@@ -661,8 +765,8 @@ func TestInvalidHeaderSize(t *testing.T) {
 	buf.Write(make([]byte, 20))
 
 	_, err := New(bytes.NewReader(buf.Bytes()), WithCP866())
-	if err == nil {
-		t.Error("Expected error for header size < 32, got nil")
+	if !errors.Is(err, ErrInvalidHeaderSize) {
+		t.Errorf("New() = %v, want ErrInvalidHeaderSize", err)
 	}
 }
 

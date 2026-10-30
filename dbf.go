@@ -350,8 +350,9 @@ func (r *Reader) readMetadata() error {
 		return fmt.Errorf("read header size: %w", err)
 	}
 	r.headerBytesNumber = binary.LittleEndian.Uint16(headerBytes)
-	if r.headerBytesNumber < metadataLength {
-		return fmt.Errorf("%w: %d (must be >= %d)", ErrInvalidHeaderSize, r.headerBytesNumber, metadataLength)
+	// the header must hold at least the metadata and the 0x0D terminator
+	if r.headerBytesNumber < metadataLength+1 {
+		return fmt.Errorf("%w: %d (must be >= %d)", ErrInvalidHeaderSize, r.headerBytesNumber, metadataLength+1)
 	}
 
 	// read record size (2 bytes, little-endian)
@@ -382,17 +383,29 @@ func (r *Reader) readMetadata() error {
 
 // readFields reads field descriptors until the 0x0D terminator, then skips
 // any remaining header padding so the reader is positioned at the first record.
+// Descriptors and the terminator must fit within the declared header size.
 func (r *Reader) readFields() error {
+	headerSize := int(r.headerBytesNumber)
+	consumed := int(metadataLength)
+
 	// header size gives an upper bound on the number of descriptors
-	r.fields = make([]Field, 0, (r.headerBytesNumber-metadataLength)/fieldLength)
+	r.fields = make([]Field, 0, (headerSize-consumed-1)/int(fieldLength))
 
 	for {
+		if consumed >= headerSize {
+			return fmt.Errorf("%w: not found within %d-byte header", ErrInvalidTerminator, headerSize)
+		}
 		b, err := r.reader.ReadByte()
 		if err != nil {
 			return fmt.Errorf("read field or terminator: %w", err)
 		}
 		if b == 0x0D {
+			consumed++
 			break
+		}
+		// the descriptor and the terminator after it must fit within the header
+		if consumed+int(fieldLength) >= headerSize {
+			return fmt.Errorf("%w: field descriptor at offset %d exceeds %d-byte header", ErrInvalidTerminator, consumed, headerSize)
 		}
 		if err := r.reader.UnreadByte(); err != nil {
 			return fmt.Errorf("unread byte: %w", err)
@@ -403,14 +416,13 @@ func (r *Reader) readFields() error {
 			return fmt.Errorf("read field %d: %w", len(r.fields), err)
 		}
 		r.fields = append(r.fields, field)
+		consumed += int(fieldLength)
 	}
 
 	// skip any padding between terminator and start of record data
 	// (e.g. Visual FoxPro backlink area or other extensions)
-	consumed := metadataLength + uint16(len(r.fields))*fieldLength + 1
-	if r.headerBytesNumber > consumed {
-		skip := int64(r.headerBytesNumber - consumed)
-		if _, err := io.CopyN(io.Discard, r.reader, skip); err != nil {
+	if skip := headerSize - consumed; skip > 0 {
+		if _, err := io.CopyN(io.Discard, r.reader, int64(skip)); err != nil {
 			return fmt.Errorf("skip header padding: %w", err)
 		}
 	}
