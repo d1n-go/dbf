@@ -627,7 +627,8 @@ func (r *Reader) String() string {
 // Record represents a single record from the DBF file.
 type Record struct {
 	Deleted bool              // true if the record is marked as deleted
-	Data    map[string]string // field values indexed by field name
+	Data    map[string]string // field values indexed by field name; "" for null values
+	Null    map[string]bool   // true for Visual FoxPro fields holding null; nil if the record has none
 }
 
 // Next advances to the next record in the DBF file, reading its raw bytes
@@ -717,6 +718,10 @@ func (r *Reader) Read() (*Record, error) {
 		bits := r.fieldBits[i]
 		if bitSet(nullFlags, bits.null) {
 			record.Data[field.Name] = ""
+			if record.Null == nil {
+				record.Null = make(map[string]bool)
+			}
+			record.Null[field.Name] = true
 			continue
 		}
 		if bitSet(nullFlags, bits.varLength) {

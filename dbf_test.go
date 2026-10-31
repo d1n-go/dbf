@@ -1531,15 +1531,32 @@ func TestVFPNullFlagsAndVarchar(t *testing.T) {
 	rec2 := slices.Concat(le32(0), make([]byte, 10), []byte{0x05})
 	rec3 := slices.Concat(le32(1), []byte("0123456789"), []byte{0x00})
 
-	got := readAllData(t, buildDBF(0x32, fields, rec1, rec2, rec3))
-	want := []map[string]string{
-		{"NUM": "5", "NAME": "Иван"},
-		{"NUM": "", "NAME": ""},
-		{"NUM": "1", "NAME": "0123456789"},
+	// empty, not null
+	rec4 := slices.Concat(le32(0), []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, []byte{0x02})
+
+	r, err := New(bytes.NewReader(buildDBF(0x32, fields, rec1, rec2, rec3, rec4)))
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
 	}
-	for i := range want {
-		if !maps.Equal(got[i], want[i]) {
-			t.Errorf("record %d = %q, want %q", i, got[i], want[i])
+	records, err := r.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll() failed: %v", err)
+	}
+	want := []struct {
+		data map[string]string
+		null map[string]bool
+	}{
+		{map[string]string{"NUM": "5", "NAME": "Иван"}, nil},
+		{map[string]string{"NUM": "", "NAME": ""}, map[string]bool{"NUM": true, "NAME": true}},
+		{map[string]string{"NUM": "1", "NAME": "0123456789"}, nil},
+		{map[string]string{"NUM": "0", "NAME": ""}, nil},
+	}
+	for i, w := range want {
+		if !maps.Equal(records[i].Data, w.data) {
+			t.Errorf("record %d Data = %q, want %q", i, records[i].Data, w.data)
+		}
+		if !maps.Equal(records[i].Null, w.null) {
+			t.Errorf("record %d Null = %v, want %v", i, records[i].Null, w.null)
 		}
 	}
 }

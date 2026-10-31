@@ -196,7 +196,15 @@ You can also specify any encoding manually using `WithEncoding()` or `WithDecode
 | Q    | Varbinary (VFP) | raw bytes |
 | W    | Blob (VFP)  | memo block number |
 
-Visual FoxPro null values are returned as `""`. The hidden `_NullFlags` system field is not included in `Record.Data`.
+Visual FoxPro null values are returned as `""` and marked in `Record.Null`, so they can be told apart from empty values:
+
+```go
+if record.Null["PRICE"] {
+    // PRICE is null
+}
+```
+
+The hidden `_NullFlags` system field is not included in `Record.Data`.
 Reading a field of any other type returns `ErrUnsupportedType`.
 
 All field values are returned as strings. Parse them as needed:
