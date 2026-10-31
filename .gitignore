@@ -3,3 +3,4 @@ cmd
 *.dbf
 CLAUDE.md
 *.out
+.DS_Store
