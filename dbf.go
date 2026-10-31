@@ -451,10 +451,9 @@ func (r *Reader) readFields() error {
 	// header size gives an upper bound on the number of descriptors
 	r.fields = make([]Field, 0, (headerSize-consumed-1)/int(fieldLength))
 
+	// readMetadata guarantees room for the terminator, and each descriptor is
+	// accepted only if the terminator still fits after it, so consumed < headerSize
 	for {
-		if consumed >= headerSize {
-			return fmt.Errorf("%w: not found within %d-byte header", ErrInvalidTerminator, headerSize)
-		}
 		b, err := r.reader.ReadByte()
 		if err != nil {
 			return fmt.Errorf("read field or terminator: %w", err)

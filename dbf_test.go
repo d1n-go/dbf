@@ -311,6 +311,16 @@ func TestFieldTypeString(t *testing.T) {
 		{'L', "Logical"},
 		{'M', "Memo"},
 		{'F', "Float"},
+		{'I', "Integer"},
+		{'B', "Double"},
+		{'Y', "Currency"},
+		{'T', "DateTime"},
+		{'G', "General"},
+		{'P', "Picture"},
+		{'V', "Varchar"},
+		{'Q', "Varbinary"},
+		{'W', "Blob"},
+		{'0', "Null flags"},
 		{'X', "Unknown (X)"},
 	}
 
@@ -1543,6 +1553,36 @@ func TestVFPBinaryTypes(t *testing.T) {
 	}
 }
 
+func TestVFPBinaryTypesInvalidLength(t *testing.T) {
+	for _, typ := range []byte{'I', 'B', 'Y', 'T', 'M'} {
+		t.Run(string(typ), func(t *testing.T) {
+			data := buildDBF(0x30, []testField{{"X", typ, 3, 0}}, []byte{1, 2, 3})
+			r, err := New(bytes.NewReader(data))
+			if err != nil {
+				t.Fatalf("New() failed: %v", err)
+			}
+			if _, err := r.ReadAll(); err == nil || !strings.Contains(err.Error(), "field X") {
+				t.Errorf("ReadAll() = %v, want field length error", err)
+			}
+		})
+	}
+}
+
+func TestVFPBinaryVarlength(t *testing.T) {
+	fields := []testField{
+		{"VB", 'V', 4, flagBinary},
+		{"Q", 'Q', 4, 0},
+		{"_NullFlags", '0', 1, flagSystem},
+	}
+	// both values shorter than the field: var-length bits 0 and 1
+	rec := []byte{0xCF, 0x00, 0, 2, 0xFF, 0, 0, 1, 0x03}
+	got := readAllData(t, buildDBF(0x32, fields, rec))
+	want := map[string]string{"VB": "\xCF\x00", "Q": "\xFF"}
+	if !maps.Equal(got[0], want) {
+		t.Errorf("Data = %q, want %q", got[0], want)
+	}
+}
+
 func TestVFPNullFlagsAndVarchar(t *testing.T) {
 	// bits: NUM null=0; NAME varlength=1, null=2
 	fields := []testField{
@@ -1646,6 +1686,24 @@ func TestUnsupportedFieldType(t *testing.T) {
 				t.Errorf("Read() = %v, want ErrUnsupportedType", err)
 			}
 		})
+	}
+}
+
+func TestReadAllPendingRecordError(t *testing.T) {
+	data := buildDBF(0x03, []testField{{"X", '@', 1, 0}}, []byte{1})
+	r, err := New(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	if !r.Next() {
+		t.Fatalf("Next() returned false: %v", r.Err())
+	}
+	records, err := r.ReadAll()
+	if !errors.Is(err, ErrUnsupportedType) {
+		t.Errorf("ReadAll() = %v, want ErrUnsupportedType", err)
+	}
+	if len(records) != 0 {
+		t.Errorf("ReadAll() returned %d records, want 0", len(records))
 	}
 }
 
