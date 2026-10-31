@@ -113,6 +113,18 @@ decoder := charmap.CodePage850.NewDecoder()
 reader, err := dbf.NewFromFile("data.dbf", dbf.WithDecoder(decoder))
 ```
 
+### Strict Mode
+
+By default any deletion flag other than `*` marks an active record. With `WithStrict()`,
+a record whose flag is neither ` ` nor `*` stops reading with `ErrInvalidDeletionFlag`:
+
+```go
+reader, err := dbf.NewFromFile("data.dbf", dbf.WithCP866(), dbf.WithStrict())
+```
+
+In both modes an end-of-file marker (`0x1A`) before the number of records declared
+in the header is reported as an error wrapping `io.ErrUnexpectedEOF`.
+
 ### Read from io.Reader
 
 ```go

@@ -1603,3 +1603,54 @@ func TestUnsupportedFieldType(t *testing.T) {
 		})
 	}
 }
+
+func TestDeletionFlag(t *testing.T) {
+	fields := []testField{{"X", 'C', 1, 0}}
+	build := func(flags ...byte) []byte {
+		records := make([][]byte, len(flags))
+		for i := range flags {
+			records[i] = []byte{'A' + byte(i)}
+		}
+		data := buildDBF(0x03, fields, records...)
+		recordsStart := len(data) - 2*len(flags)
+		for i, f := range flags {
+			data[recordsStart+2*i] = f
+		}
+		return data
+	}
+
+	tests := []struct {
+		name    string
+		data    []byte
+		opts    []Option
+		count   int
+		wantErr error
+	}{
+		{"active and deleted", build(0x20, 0x2A), nil, 2, nil},
+		{"strict active and deleted", build(0x20, 0x2A), []Option{WithStrict()}, 2, nil},
+		{"lenient unknown flag", build(0x00, 0xFF), nil, 2, nil},
+		{"strict zero flag", build(0x20, 0x00), []Option{WithStrict()}, 1, ErrInvalidDeletionFlag},
+		{"strict 0xFF flag", build(0xFF, 0x20), []Option{WithStrict()}, 0, ErrInvalidDeletionFlag},
+		{"EOF marker before last record", build(0x20, 0x1A), nil, 1, io.ErrUnexpectedEOF},
+		{"strict EOF marker", build(0x1A, 0x20), []Option{WithStrict()}, 0, io.ErrUnexpectedEOF},
+		{"EOF marker after last record", append(build(0x20, 0x2A), 0x1A), nil, 2, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, err := New(bytes.NewReader(tt.data), tt.opts...)
+			if err != nil {
+				t.Fatalf("New() failed: %v", err)
+			}
+			records, err := r.ReadAll()
+			if len(records) != tt.count {
+				t.Errorf("ReadAll() returned %d records, want %d", len(records), tt.count)
+			}
+			if tt.wantErr == nil && err != nil {
+				t.Errorf("ReadAll() = %v, want nil", err)
+			}
+			if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
+				t.Errorf("ReadAll() = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}

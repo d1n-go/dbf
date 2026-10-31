@@ -47,15 +47,16 @@ import (
 
 // Sentinel errors returned by the library.
 var (
-	ErrInvalidFileType    = errors.New("invalid file type")
-	ErrInvalidHeaderSize  = errors.New("invalid header size")
-	ErrInvalidRecordSize  = errors.New("invalid record size")
-	ErrUnknownEncoding    = errors.New("unable to determine encoding")
-	ErrInvalidTerminator  = errors.New("invalid field descriptor terminator")
-	ErrFieldOutOfBounds   = errors.New("field exceeds record bounds")
-	ErrReadBeforeNext     = errors.New("Read called before Next")
-	ErrRecordSizeMismatch = errors.New("record size mismatch")
-	ErrUnsupportedType    = errors.New("unsupported field type")
+	ErrInvalidFileType     = errors.New("invalid file type")
+	ErrInvalidHeaderSize   = errors.New("invalid header size")
+	ErrInvalidRecordSize   = errors.New("invalid record size")
+	ErrUnknownEncoding     = errors.New("unable to determine encoding")
+	ErrInvalidTerminator   = errors.New("invalid field descriptor terminator")
+	ErrFieldOutOfBounds    = errors.New("field exceeds record bounds")
+	ErrReadBeforeNext      = errors.New("Read called before Next")
+	ErrRecordSizeMismatch  = errors.New("record size mismatch")
+	ErrUnsupportedType     = errors.New("unsupported field type")
+	ErrInvalidDeletionFlag = errors.New("invalid deletion flag")
 )
 
 // FileType represents the type of DBF file format.
@@ -211,6 +212,7 @@ type Reader struct {
 	nullFlagsEnd      int         // end offset of the _NullFlags field; 0 if the table has none
 
 	decoder       *encoding.Decoder
+	strict        bool
 	reader        *bufio.Reader
 	currentRecord uint32 // number of records consumed from the input by Next()
 	pending       bool   // Next() loaded a record into buf that Read() has not yet returned
@@ -256,6 +258,16 @@ func WithCP1251() Option {
 // This is the default Windows encoding for Western European languages.
 func WithCP1252() Option {
 	return WithEncoding(charmap.Windows1252)
+}
+
+// WithStrict enables strict validation of record data. Currently a record
+// whose deletion flag is neither ' ' (0x20) nor '*' (0x2A) stops reading
+// with ErrInvalidDeletionFlag. By default any byte other than '*' marks
+// an active record.
+func WithStrict() Option {
+	return func(r *Reader) {
+		r.strict = true
+	}
 }
 
 // New creates a new DBF Reader from an io.Reader.
@@ -648,6 +660,16 @@ func (r *Reader) Next() bool {
 	}
 	if _, err := io.ReadFull(r.reader, r.buf); err != nil {
 		r.err = fmt.Errorf("read record %d: %w", r.currentRecord, err)
+		return false
+	}
+
+	switch flag := r.buf[0]; {
+	case flag == 0x1A:
+		// end-of-file marker before the declared number of records
+		r.err = fmt.Errorf("read record %d: end-of-file marker, header declares %d records: %w", r.currentRecord, r.recordsCount, io.ErrUnexpectedEOF)
+		return false
+	case r.strict && flag != 0x20 && flag != 0x2A:
+		r.err = fmt.Errorf("%w: 0x%02X in record %d", ErrInvalidDeletionFlag, flag, r.currentRecord)
 		return false
 	}
 
