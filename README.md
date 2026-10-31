@@ -41,6 +41,7 @@ func main() {
     if err != nil {
         log.Fatal(err)
     }
+    defer reader.Close() // the Reader owns the file opened by NewFromFile
     
     // Read all records
     records, err := reader.ReadAll()
@@ -69,6 +70,7 @@ reader, err := dbf.NewFromFile("large.dbf", dbf.WithCP866())
 if err != nil {
     log.Fatal(err)
 }
+defer reader.Close()
 
 for reader.Next() {
     record, err := reader.Read()
@@ -95,6 +97,7 @@ reader, err := dbf.NewFromFile("data.dbf") // No encoding specified
 if err != nil {
     log.Fatal(err)
 }
+defer reader.Close()
 ```
 
 ### Specify Custom Encoding
@@ -138,6 +141,7 @@ reader, err := dbf.New(file, dbf.WithCP866())
 if err != nil {
     log.Fatal(err)
 }
+// the caller owns the file: reader.Close() does not close it
 ```
 
 ### Access Field Metadata
@@ -147,6 +151,7 @@ reader, err := dbf.NewFromFile("data.dbf", dbf.WithCP866())
 if err != nil {
     log.Fatal(err)
 }
+defer reader.Close()
 
 fmt.Printf("File Type: %s\n", reader.FileType())
 fmt.Printf("Last Update: %s\n", reader.LastUpdate())
@@ -196,15 +201,6 @@ You can also specify any encoding manually using `WithEncoding()` or `WithDecode
 | Q    | Varbinary (VFP) | raw bytes |
 | W    | Blob (VFP)  | memo block number |
 
-Visual FoxPro null values are returned as `""` and marked in `Record.Null`, so they can be told apart from empty values:
-
-```go
-if record.Null["PRICE"] {
-    // PRICE is null
-}
-```
-
-The hidden `_NullFlags` system field is not included in `Record.Data`.
 Reading a field of any other type returns `ErrUnsupportedType`.
 
 All field values are returned as strings. Parse them as needed:
@@ -214,6 +210,24 @@ age, _ := strconv.Atoi(record.Data["AGE"])
 price, _ := strconv.ParseFloat(record.Data["PRICE"], 64)
 date, _ := time.Parse("20060102", record.Data["BIRTHDATE"])
 ```
+
+### Memo Fields
+
+Memo contents live in a separate `.DBT`/`.FPT` file, which this library does not read.
+For `M`, `G`, `P` (and `W`, or `B` in dBase files) fields `Record.Data` holds only the
+block number in that file, e.g. `"12"`, or `""` if the field is empty.
+
+### Null Values
+
+Visual FoxPro null values are returned as `""` and marked in `Record.Null`, so they can be told apart from empty values:
+
+```go
+if record.Null["PRICE"] {
+    // PRICE is null
+}
+```
+
+The hidden `_NullFlags` system field is not included in `Record.Data`.
 
 ## API Documentation
 

@@ -1112,8 +1112,8 @@ func createDBFWithLogicalAndFloat() []byte {
 		buf.WriteString(score)
 		buf.WriteString(note)
 	}
-	writeRecord(0x20, "T", "  3.14  ", "memo1     ")
-	writeRecord(0x20, "t", "  2.71  ", "memo2     ")
+	writeRecord(0x20, "T", "  3.14  ", "         1")
+	writeRecord(0x20, "t", "  2.71  ", "        42")
 	writeRecord(0x20, "Y", "  1.00  ", "          ")
 	writeRecord(0x20, "F", "  0.00  ", "          ")
 	writeRecord(0x20, "N", "  0.00  ", "          ")
@@ -1160,10 +1160,9 @@ func TestDecodeFieldValueLogicalAndFloat(t *testing.T) {
 		t.Errorf("record[0] SCORE: expected \"3.14\", got %q", score)
 	}
 
-	// memo field returned as trimmed string
-	note := strings.TrimSpace(records[0].Data["NOTE"])
-	if note != "memo1" {
-		t.Errorf("record[0] NOTE: expected \"memo1\", got %q", note)
+	// memo field holds the block number in the memo file
+	if note := records[0].Data["NOTE"]; note != "1" {
+		t.Errorf("record[0] NOTE: expected block number \"1\", got %q", note)
 	}
 }
 
