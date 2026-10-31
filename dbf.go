@@ -57,6 +57,7 @@ var (
 	ErrRecordSizeMismatch  = errors.New("record size mismatch")
 	ErrUnsupportedType     = errors.New("unsupported field type")
 	ErrInvalidDeletionFlag = errors.New("invalid deletion flag")
+	ErrInvalidFieldName    = errors.New("invalid field name")
 )
 
 // FileType represents the type of DBF file format.
@@ -471,6 +472,15 @@ func (r *Reader) readFields() error {
 		if err != nil {
 			return fmt.Errorf("read field %d: %w", len(r.fields), err)
 		}
+		// Record.Data is keyed by name, so names must be non-empty and unique
+		if field.Name == "" {
+			return fmt.Errorf("%w: field %d has an empty name", ErrInvalidFieldName, len(r.fields))
+		}
+		for i, f := range r.fields {
+			if f.Name == field.Name {
+				return fmt.Errorf("%w: field %d duplicates name %q of field %d", ErrInvalidFieldName, len(r.fields), field.Name, i)
+			}
+		}
 		r.fields = append(r.fields, field)
 		consumed += int(fieldLength)
 	}
@@ -537,7 +547,11 @@ func (r *Reader) readField() (Field, error) {
 	}
 
 	// field name (11 bytes, null-terminated)
-	nameBytes := bytes.TrimRight(fieldBytes[0:11], "\x00")
+	// the name ends at the first NUL; bytes after it may be garbage
+	nameBytes := fieldBytes[0:11]
+	if i := bytes.IndexByte(nameBytes, 0); i >= 0 {
+		nameBytes = nameBytes[:i]
+	}
 	decodedName, err := r.decoder.Bytes(nameBytes)
 	if err != nil {
 		// if decoding fails, use the raw bytes

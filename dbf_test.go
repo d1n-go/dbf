@@ -1671,3 +1671,37 @@ func TestDeletionFlag(t *testing.T) {
 		})
 	}
 }
+
+func TestFieldNames(t *testing.T) {
+	t.Run("garbage after NUL", func(t *testing.T) {
+		data := buildDBF(0x03, []testField{{"NAME\x00junk", 'C', 1, 0}}, []byte("A"))
+		got := readAllData(t, data)
+		if !maps.Equal(got[0], map[string]string{"NAME": "A"}) {
+			t.Errorf("Data = %q, want NAME key", got[0])
+		}
+	})
+	t.Run("max length", func(t *testing.T) {
+		data := buildDBF(0x03, []testField{{"ABCDEFGHIJK", 'C', 1, 0}}, []byte("A"))
+		got := readAllData(t, data)
+		if got[0]["ABCDEFGHIJK"] != "A" {
+			t.Errorf("Data = %q, want 11-character name", got[0])
+		}
+	})
+
+	tests := []struct {
+		name   string
+		fields []testField
+	}{
+		{"duplicate", []testField{{"X", 'C', 1, 0}, {"X", 'C', 1, 0}}},
+		{"duplicate after NUL", []testField{{"X", 'C', 1, 0}, {"X\x00Y", 'C', 1, 0}}},
+		{"empty", []testField{{"", 'C', 1, 0}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := New(bytes.NewReader(buildDBF(0x03, tt.fields)))
+			if !errors.Is(err, ErrInvalidFieldName) {
+				t.Errorf("New() = %v, want ErrInvalidFieldName", err)
+			}
+		})
+	}
+}
