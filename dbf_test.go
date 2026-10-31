@@ -5,8 +5,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"io/fs"
 	"maps"
 	"math"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -1165,26 +1168,50 @@ func TestDecodeFieldValueLogicalAndFloat(t *testing.T) {
 }
 
 func TestNewFromFileNotFound(t *testing.T) {
-	_, err := NewFromFile("/nonexistent/path/file.dbf", WithCP866())
-	if err == nil {
-		t.Error("Expected error for non-existent file, got nil")
+	_, err := NewFromFile(filepath.Join(t.TempDir(), "missing.dbf"), WithCP866())
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("NewFromFile() = %v, want fs.ErrNotExist", err)
 	}
 }
 
+// writeTempDBF writes data to a file in a temporary directory and returns its path.
+func writeTempDBF(t *testing.T, data []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "test.dbf")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+	return path
+}
+
 func TestNewFromFileAndClose(t *testing.T) {
-	r, err := NewFromFile("test.dbf", WithCP866())
+	r, err := NewFromFile(writeTempDBF(t, createMinimalDBF()), WithCP866())
 	if err != nil {
-		t.Skip("test.dbf not available:", err)
+		t.Fatalf("NewFromFile() failed: %v", err)
+	}
+	records, err := r.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll() failed: %v", err)
+	}
+	if len(records) != 2 || records[0].Data["NAME"] != "John Doe" {
+		t.Errorf("ReadAll() returned unexpected records: %d", len(records))
 	}
 	if err := r.Close(); err != nil {
 		t.Errorf("Close() returned error: %v", err)
 	}
 }
 
+func TestNewFromFileInvalid(t *testing.T) {
+	_, err := NewFromFile(writeTempDBF(t, []byte{0xFF}), WithCP866())
+	if !errors.Is(err, ErrInvalidFileType) {
+		t.Errorf("NewFromFile() = %v, want ErrInvalidFileType", err)
+	}
+}
+
 func TestCloseIdempotent(t *testing.T) {
-	r, err := NewFromFile("test.dbf", WithCP866())
+	r, err := NewFromFile(writeTempDBF(t, createMinimalDBF()), WithCP866())
 	if err != nil {
-		t.Skip("test.dbf not available:", err)
+		t.Fatalf("NewFromFile() failed: %v", err)
 	}
 	if err := r.Close(); err != nil {
 		t.Fatalf("first Close() error: %v", err)
