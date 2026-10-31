@@ -34,8 +34,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -53,6 +55,7 @@ var (
 	ErrFieldOutOfBounds   = errors.New("field exceeds record bounds")
 	ErrReadBeforeNext     = errors.New("Read called before Next")
 	ErrRecordSizeMismatch = errors.New("record size mismatch")
+	ErrUnsupportedType    = errors.New("unsupported field type")
 )
 
 // FileType represents the type of DBF file format.
@@ -135,11 +138,22 @@ const (
 // Field represents a single field definition in a DBF table.
 type Field struct {
 	Name          string // field name (max 11 characters)
-	Type          byte   // field type (C=Character, N=Numeric, D=Date, L=Logical, M=Memo, F=Float)
+	Type          byte   // field type (C=Character, N=Numeric, D=Date, L=Logical, M=Memo, F=Float, ...)
 	MemoryAddress uint32 // memory address (reserved, not used in file-based DBF)
 	Length        uint16 // field length in bytes; uint16 to support VFP character fields > 255 bytes
 	DecimalCount  byte   // number of decimal places (for numeric fields)
+	Flags         byte   // Visual FoxPro field flags (0x01 system, 0x02 nullable, 0x04 binary); 0 for other formats
 }
+
+// Visual FoxPro field flags (byte 18 of the field descriptor).
+const (
+	flagSystem   byte = 0x01 // hidden system column, e.g. _NullFlags
+	flagNullable byte = 0x02 // column can store null values
+	flagBinary   byte = 0x04 // binary column (Character, Varchar and Memo only)
+)
+
+// julianDayUnixEpoch is the Julian day number of 1970-01-01.
+const julianDayUnixEpoch = 2440588
 
 // TypeString returns a human-readable description of the field type.
 func (f Field) TypeString() string {
@@ -156,6 +170,26 @@ func (f Field) TypeString() string {
 		return "Memo"
 	case 'F':
 		return "Float"
+	case 'I':
+		return "Integer"
+	case 'B':
+		return "Double"
+	case 'Y':
+		return "Currency"
+	case 'T':
+		return "DateTime"
+	case 'G':
+		return "General"
+	case 'P':
+		return "Picture"
+	case 'V':
+		return "Varchar"
+	case 'Q':
+		return "Varbinary"
+	case 'W':
+		return "Blob"
+	case '0':
+		return "Null flags"
 	default:
 		return fmt.Sprintf("Unknown (%c)", f.Type)
 	}
@@ -172,6 +206,9 @@ type Reader struct {
 	headerBytesNumber uint16
 	recordBytesNumber uint16
 	fields            []Field
+	fieldBits         []fieldBits // per-field positions in the VFP _NullFlags bitmap
+	nullFlagsStart    int         // offset of the VFP _NullFlags field within a record
+	nullFlagsEnd      int         // end offset of the _NullFlags field; 0 if the table has none
 
 	decoder       *encoding.Decoder
 	reader        *bufio.Reader
@@ -279,6 +316,13 @@ func NewFromFile(path string, opts ...Option) (*Reader, error) {
 
 	reader.file = file
 	return reader, nil
+}
+
+// fieldBits holds a field's bit positions in the VFP _NullFlags bitmap;
+// -1 means the field has no such bit.
+type fieldBits struct {
+	varLength int // set when a Varchar/Varbinary value is shorter than the field
+	null      int // set when the value is null
 }
 
 // FileType returns the DBF file type identifier.
@@ -436,7 +480,41 @@ func (r *Reader) readFields() error {
 		return fmt.Errorf("%w: fields sum to %d bytes but header declares %d", ErrRecordSizeMismatch, total, r.recordBytesNumber)
 	}
 
+	r.assignNullFlagBits()
+
 	return nil
+}
+
+// assignNullFlagBits maps fields to bits of the VFP _NullFlags bitmap.
+// Bits are assigned in field order: each Varchar/Varbinary field gets a
+// var-length bit, followed by a null bit if the field is nullable.
+func (r *Reader) assignNullFlagBits() {
+	r.fieldBits = make([]fieldBits, len(r.fields))
+	bit := 0
+	offset := 1 // deletion flag
+	for i, f := range r.fields {
+		fb := fieldBits{varLength: -1, null: -1}
+		if r.isVFP() {
+			if f.Type == '0' {
+				r.nullFlagsStart, r.nullFlagsEnd = offset, offset+int(f.Length)
+			}
+			if f.Type == 'V' || f.Type == 'Q' {
+				fb.varLength = bit
+				bit++
+			}
+			if f.Flags&flagNullable != 0 {
+				fb.null = bit
+				bit++
+			}
+		}
+		r.fieldBits[i] = fb
+		offset += int(f.Length)
+	}
+}
+
+// isVFP reports whether the file is a Visual FoxPro table.
+func (r *Reader) isVFP() bool {
+	return r.fileType == VisualFoxPro || r.fileType == VisualFoxProAI || r.fileType == VisualFoxProVarchar
 }
 
 // readField reads a single 32-byte field descriptor.
@@ -459,8 +537,7 @@ func (r *Reader) readField() (Field, error) {
 	var decimalCount byte
 
 	// visual FoxPro stores character field length as a little-endian uint16 in bytes 16-17.
-	isVFPChar := fieldType == 'C' && (r.fileType == VisualFoxPro || r.fileType == VisualFoxProAI || r.fileType == VisualFoxProVarchar)
-	if isVFPChar {
+	if fieldType == 'C' && r.isVFP() {
 		length = binary.LittleEndian.Uint16(fieldBytes[16:18])
 	} else {
 		length = uint16(fieldBytes[16])
@@ -473,6 +550,9 @@ func (r *Reader) readField() (Field, error) {
 		MemoryAddress: binary.LittleEndian.Uint32(fieldBytes[12:16]),
 		Length:        length,
 		DecimalCount:  decimalCount,
+	}
+	if r.isVFP() {
+		field.Flags = fieldBytes[18]
 	}
 
 	return field, nil
@@ -594,9 +674,11 @@ func (r *Reader) Read() (*Record, error) {
 		Data:    make(map[string]string, len(r.fields)),
 	}
 
+	nullFlags := r.nullFlags(recordBytes)
+
 	// parse individual fields
 	offset := 1 // skip deletion flag
-	for _, field := range r.fields {
+	for i, field := range r.fields {
 		end := offset + int(field.Length)
 		if end > len(recordBytes) {
 			r.err = fmt.Errorf("%w: field %s (offset %d + length %d > record size %d)", ErrFieldOutOfBounds, field.Name, offset, field.Length, len(recordBytes))
@@ -604,6 +686,26 @@ func (r *Reader) Read() (*Record, error) {
 		}
 		fieldData := recordBytes[offset:end]
 		offset += int(field.Length)
+
+		// hidden system columns such as _NullFlags are not returned
+		if field.Flags&flagSystem != 0 {
+			continue
+		}
+
+		bits := r.fieldBits[i]
+		if bitSet(nullFlags, bits.null) {
+			record.Data[field.Name] = ""
+			continue
+		}
+		if bitSet(nullFlags, bits.varLength) {
+			// the actual length of a shorter Varchar/Varbinary value is in the last byte
+			n := int(fieldData[len(fieldData)-1])
+			if n >= len(fieldData) {
+				r.err = fmt.Errorf("%w: field %s var length %d exceeds field length %d", ErrFieldOutOfBounds, field.Name, n, field.Length)
+				return nil, r.err
+			}
+			fieldData = fieldData[:n]
+		}
 
 		// decode field value
 		value, err := r.decodeFieldValue(field, fieldData)
@@ -621,6 +723,20 @@ func (r *Reader) Read() (*Record, error) {
 // maxInitialCap limits the initial ReadAll allocation so that a malicious
 // records count in the header cannot cause a huge preallocation.
 const maxInitialCap = 1 << 20
+
+// nullFlags returns the VFP _NullFlags bytes of a record, or nil if the table has none.
+func (r *Reader) nullFlags(record []byte) []byte {
+	return record[r.nullFlagsStart:r.nullFlagsEnd]
+}
+
+// bitSet reports whether bit n (LSB first) is set in flags.
+// Bits outside the bitmap, including n < 0, are reported as unset.
+func bitSet(flags []byte, n int) bool {
+	if n < 0 || n/8 >= len(flags) {
+		return false
+	}
+	return flags[n/8]&(1<<(n%8)) != 0
+}
 
 // ReadAll reads all remaining records from the DBF file into memory.
 // If Next() has loaded a record that has not been returned by Read() yet,
@@ -675,6 +791,61 @@ func (r *Reader) Err() error {
 
 // decodeFieldValue decodes a field's raw bytes into a string based on its type.
 func (r *Reader) decodeFieldValue(field Field, data []byte) (string, error) {
+	if r.isVFP() {
+		switch field.Type {
+		case 'I': // 32-bit little-endian integer
+			if len(data) != 4 {
+				return "", fmt.Errorf("integer field length %d, want 4", len(data))
+			}
+			return strconv.FormatInt(int64(int32(binary.LittleEndian.Uint32(data))), 10), nil
+
+		case 'B': // 64-bit little-endian IEEE 754 double
+			if len(data) != 8 {
+				return "", fmt.Errorf("double field length %d, want 8", len(data))
+			}
+			return strconv.FormatFloat(math.Float64frombits(binary.LittleEndian.Uint64(data)), 'f', -1, 64), nil
+
+		case 'Y': // 64-bit little-endian integer scaled by 10000
+			if len(data) != 8 {
+				return "", fmt.Errorf("currency field length %d, want 8", len(data))
+			}
+			return formatCurrency(int64(binary.LittleEndian.Uint64(data))), nil
+
+		case 'T': // Julian day number and milliseconds since midnight, both 32-bit little-endian
+			if len(data) != 8 {
+				return "", fmt.Errorf("datetime field length %d, want 8", len(data))
+			}
+			return formatDateTime(int32(binary.LittleEndian.Uint32(data[:4])), int32(binary.LittleEndian.Uint32(data[4:]))), nil
+
+		case 'M', 'G', 'P', 'W': // 32-bit little-endian block number in the memo file
+			if len(data) != 4 {
+				return "", fmt.Errorf("memo field length %d, want 4", len(data))
+			}
+			if block := binary.LittleEndian.Uint32(data); block != 0 {
+				return strconv.FormatUint(uint64(block), 10), nil
+			}
+			return "", nil
+
+		case 'C': // binary character data is returned as is
+			if field.Flags&flagBinary != 0 {
+				return string(data), nil
+			}
+
+		case 'V': // varchar: length already resolved by the caller, no padding to trim
+			if field.Flags&flagBinary != 0 {
+				return string(data), nil
+			}
+			decoded, err := r.decoder.Bytes(data)
+			if err != nil {
+				return string(data), nil
+			}
+			return string(decoded), nil
+
+		case 'Q': // varbinary is returned as is
+			return string(data), nil
+		}
+	}
+
 	switch field.Type {
 	case 'C': // character field: decode to UTF-8 first, then trim spaces
 		decoded, err := r.decoder.Bytes(data)
@@ -701,16 +872,33 @@ func (r *Reader) decodeFieldValue(field Field, data []byte) (string, error) {
 		}
 		return "", nil
 
-	case 'M': // memo field (reference to external memo file)
+	case 'M', 'G', 'P', 'B': // memo, general, picture, binary: ASCII block number in the memo file
 		return string(bytes.TrimSpace(data)), nil
 
-	default: // unknown field type - decode as character
-		decoded, err := r.decoder.Bytes(data)
-		if err != nil {
-			return strings.TrimSpace(string(data)), nil
-		}
-		return strings.TrimSpace(string(decoded)), nil
+	default:
+		return "", fmt.Errorf("%w: %q", ErrUnsupportedType, field.Type)
 	}
+}
+
+// formatCurrency formats a VFP currency value stored as an integer scaled by 10000.
+func formatCurrency(v int64) string {
+	sign := ""
+	u := uint64(v)
+	if v < 0 {
+		sign = "-"
+		u = -u
+	}
+	return fmt.Sprintf("%s%d.%04d", sign, u/10000, u%10000)
+}
+
+// formatDateTime formats a VFP datetime as "2006-01-02T15:04:05",
+// rounding to the nearest second. An all-zero value is returned as "".
+func formatDateTime(julianDay, millis int32) string {
+	if julianDay == 0 && millis == 0 {
+		return ""
+	}
+	seconds := (int64(julianDay)-julianDayUnixEpoch)*86400 + (int64(millis)+500)/1000
+	return time.Unix(seconds, 0).UTC().Format("2006-01-02T15:04:05")
 }
 
 // Close closes the underlying file if the Reader was created with NewFromFile.

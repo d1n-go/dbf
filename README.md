@@ -168,14 +168,24 @@ You can also specify any encoding manually using `WithEncoding()` or `WithDecode
 
 ## Supported Field Types
 
-| Type | Description | Go Type |
-|------|-------------|---------|
-| C    | Character   | string  |
-| N    | Numeric     | string  |
-| D    | Date        | string (YYYYMMDD) |
-| L    | Logical     | string ("true"/"false") |
-| M    | Memo        | string  |
-| F    | Float       | string  |
+| Type | Description | Returned value |
+|------|-------------|----------------|
+| C    | Character   | decoded text, spaces trimmed; raw bytes if the VFP binary flag is set |
+| N    | Numeric     | text as stored, e.g. `"123.45"` |
+| F    | Float       | text as stored |
+| D    | Date        | `YYYYMMDD` |
+| L    | Logical     | `"true"`, `"false"` or `""` |
+| M, G, P | Memo, General, Picture | memo block number, e.g. `"12"`; `""` if empty (memo file contents are not read) |
+| B    | Double (VFP) | e.g. `"3.14"`; in dBase files, a memo block number like M |
+| I    | Integer (VFP) | e.g. `"-42"` |
+| Y    | Currency (VFP) | four decimal places, e.g. `"12.3400"` |
+| T    | DateTime (VFP) | `2006-01-02T15:04:05`, `""` if empty |
+| V    | Varchar (VFP) | decoded text, not trimmed |
+| Q    | Varbinary (VFP) | raw bytes |
+| W    | Blob (VFP)  | memo block number |
+
+Visual FoxPro null values are returned as `""`. The hidden `_NullFlags` system field is not included in `Record.Data`.
+Reading a field of any other type returns `ErrUnsupportedType`.
 
 All field values are returned as strings. Parse them as needed:
 
