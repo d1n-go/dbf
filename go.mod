@@ -1,5 +1,5 @@
 module github.com/d1n-go/dbf
 
-go 1.25
+go 1.25.0
 
-require golang.org/x/text v0.33.0 // indirect
+require golang.org/x/text v0.41.0

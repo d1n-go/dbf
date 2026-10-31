@@ -12,7 +12,7 @@ A pure Go library for reading DBF (dBase, FoxPro, Visual FoxPro) files with supp
 
 - ✅ Read DBF files in various formats (dBase III, FoxPro, Visual FoxPro)
 - ✅ Automatic encoding detection from Language Driver ID
-- ✅ Support for multiple encodings (CP866, CP1251, CP1252, CP437, CP850)
+- ✅ Support for multiple encodings (CP866, CP1251, CP1252, CP437, CP850, CP852)
 - ✅ Memory-efficient streaming for large files
 - ✅ Simple, idiomatic Go API
 - ✅ No external dependencies except `golang.org/x/text`
@@ -41,6 +41,7 @@ func main() {
     if err != nil {
         log.Fatal(err)
     }
+    defer reader.Close() // the Reader owns the file opened by NewFromFile
     
     // Read all records
     records, err := reader.ReadAll()
@@ -69,6 +70,7 @@ reader, err := dbf.NewFromFile("large.dbf", dbf.WithCP866())
 if err != nil {
     log.Fatal(err)
 }
+defer reader.Close()
 
 for reader.Next() {
     record, err := reader.Read()
@@ -95,6 +97,7 @@ reader, err := dbf.NewFromFile("data.dbf") // No encoding specified
 if err != nil {
     log.Fatal(err)
 }
+defer reader.Close()
 ```
 
 ### Specify Custom Encoding
@@ -113,6 +116,18 @@ decoder := charmap.CodePage850.NewDecoder()
 reader, err := dbf.NewFromFile("data.dbf", dbf.WithDecoder(decoder))
 ```
 
+### Strict Mode
+
+By default any deletion flag other than `*` marks an active record. With `WithStrict()`,
+a record whose flag is neither ` ` nor `*` stops reading with `ErrInvalidDeletionFlag`:
+
+```go
+reader, err := dbf.NewFromFile("data.dbf", dbf.WithCP866(), dbf.WithStrict())
+```
+
+In both modes an end-of-file marker (`0x1A`) before the number of records declared
+in the header is reported as an error wrapping `io.ErrUnexpectedEOF`.
+
 ### Read from io.Reader
 
 ```go
@@ -126,6 +141,7 @@ reader, err := dbf.New(file, dbf.WithCP866())
 if err != nil {
     log.Fatal(err)
 }
+// the caller owns the file: reader.Close() does not close it
 ```
 
 ### Access Field Metadata
@@ -135,6 +151,7 @@ reader, err := dbf.NewFromFile("data.dbf", dbf.WithCP866())
 if err != nil {
     log.Fatal(err)
 }
+defer reader.Close()
 
 fmt.Printf("File Type: %s\n", reader.FileType())
 fmt.Printf("Last Update: %s\n", reader.LastUpdate())
@@ -157,8 +174,9 @@ The library automatically detects these encodings from Language Driver ID:
 
 | LDID   | Encoding | Description |
 |--------|----------|-------------|
-| 0x26   | CP866    | Russian MS-DOS |
-| 0x64, 0x65, 0xC9 | CP1251 | Russian Windows |
+| 0x26, 0x65 | CP866 | Russian MS-DOS |
+| 0x64   | CP852    | Eastern European MS-DOS |
+| 0xC9   | CP1251   | Russian Windows |
 | 0x03   | CP1252   | Windows ANSI |
 | 0x01   | CP437    | US MS-DOS |
 | 0x02   | CP850    | International MS-DOS |
@@ -167,14 +185,23 @@ You can also specify any encoding manually using `WithEncoding()` or `WithDecode
 
 ## Supported Field Types
 
-| Type | Description | Go Type |
-|------|-------------|---------|
-| C    | Character   | string  |
-| N    | Numeric     | string  |
-| D    | Date        | string (YYYYMMDD) |
-| L    | Logical     | string ("true"/"false") |
-| M    | Memo        | string  |
-| F    | Float       | string  |
+| Type | Description | Returned value |
+|------|-------------|----------------|
+| C    | Character   | decoded text, spaces trimmed; raw bytes if the VFP binary flag is set |
+| N    | Numeric     | text as stored, e.g. `"123.45"` |
+| F    | Float       | text as stored |
+| D    | Date        | `YYYYMMDD` |
+| L    | Logical     | `"true"`, `"false"` or `""` |
+| M, G, P | Memo, General, Picture | memo block number, e.g. `"12"`; `""` if empty (memo file contents are not read) |
+| B    | Double (VFP) | e.g. `"3.14"`; in dBase files, a memo block number like M |
+| I    | Integer (VFP) | e.g. `"-42"` |
+| Y    | Currency (VFP) | four decimal places, e.g. `"12.3400"` |
+| T    | DateTime (VFP) | `2006-01-02T15:04:05`, `""` if empty |
+| V    | Varchar (VFP) | decoded text, not trimmed |
+| Q    | Varbinary (VFP) | raw bytes |
+| W    | Blob (VFP)  | memo block number |
+
+Reading a field of any other type returns `ErrUnsupportedType`.
 
 All field values are returned as strings. Parse them as needed:
 
@@ -183,6 +210,24 @@ age, _ := strconv.Atoi(record.Data["AGE"])
 price, _ := strconv.ParseFloat(record.Data["PRICE"], 64)
 date, _ := time.Parse("20060102", record.Data["BIRTHDATE"])
 ```
+
+### Memo Fields
+
+Memo contents live in a separate `.DBT`/`.FPT` file, which this library does not read.
+For `M`, `G`, `P` (and `W`, or `B` in dBase files) fields `Record.Data` holds only the
+block number in that file, e.g. `"12"`, or `""` if the field is empty.
+
+### Null Values
+
+Visual FoxPro null values are returned as `""` and marked in `Record.Null`, so they can be told apart from empty values:
+
+```go
+if record.Null["PRICE"] {
+    // PRICE is null
+}
+```
+
+The hidden `_NullFlags` system field is not included in `Record.Data`.
 
 ## API Documentation
 

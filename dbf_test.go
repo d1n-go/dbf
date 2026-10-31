@@ -4,11 +4,20 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
+	"io/fs"
+	"maps"
+	"math"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/charmap"
+	"golang.org/x/text/transform"
 )
 
 // createMinimalDBF creates a minimal valid DBF file for testing
@@ -262,6 +271,35 @@ func TestFields(t *testing.T) {
 	}
 }
 
+func TestFieldsReturnsCopy(t *testing.T) {
+	r, err := New(bytes.NewReader(createDBFWithMultipleFields()), WithCP866())
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	fields := r.Fields()
+	fields[0].Name = "MUTATED"
+	fields[0].Length = 1
+
+	if got := r.Fields()[0]; got.Name != "NAME" || got.Length != 10 {
+		t.Errorf("Fields() exposed internal state: got %+v", got)
+	}
+
+	if !r.Next() {
+		t.Fatal("Next() returned false")
+	}
+	record, err := r.Read()
+	if err != nil {
+		t.Fatalf("Read() failed: %v", err)
+	}
+	if _, ok := record.Data["MUTATED"]; ok {
+		t.Error("record contains mutated field name")
+	}
+	if _, ok := record.Data["NAME"]; !ok {
+		t.Error("record is missing NAME field")
+	}
+}
+
 func TestFieldTypeString(t *testing.T) {
 	tests := []struct {
 		fieldType byte
@@ -273,6 +311,16 @@ func TestFieldTypeString(t *testing.T) {
 		{'L', "Logical"},
 		{'M', "Memo"},
 		{'F', "Float"},
+		{'I', "Integer"},
+		{'B', "Double"},
+		{'Y', "Currency"},
+		{'T', "DateTime"},
+		{'G', "General"},
+		{'P', "Picture"},
+		{'V', "Varchar"},
+		{'Q', "Varbinary"},
+		{'W', "Blob"},
+		{'0', "Null flags"},
 		{'X', "Unknown (X)"},
 	}
 
@@ -488,27 +536,131 @@ func TestEncodingAutodetectionFails(t *testing.T) {
 	}
 }
 
+// writeHeader writes a 32-byte dBase III header with CP866 LDID.
+func writeHeader(buf *bytes.Buffer, records uint32, headerSize, recordSize uint16) {
+	buf.WriteByte(0x03)
+	buf.Write([]byte{124, 1, 15})
+	binary.Write(buf, binary.LittleEndian, records)
+	binary.Write(buf, binary.LittleEndian, headerSize)
+	binary.Write(buf, binary.LittleEndian, recordSize)
+	reserved := make([]byte, 20)
+	reserved[17] = 0x26
+	buf.Write(reserved)
+}
+
+// writeCharField writes a 32-byte descriptor for a C field.
+func writeCharField(buf *bytes.Buffer, name string, length byte) {
+	b := make([]byte, 32)
+	copy(b, name)
+	b[11] = 'C'
+	b[16] = length
+	buf.Write(b)
+}
+
 func TestInvalidTerminator(t *testing.T) {
 	buf := new(bytes.Buffer)
-
-	// valid header
-	buf.WriteByte(0x03)
-	buf.Write(make([]byte, 10))
-	binary.Write(buf, binary.LittleEndian, uint32(0)) // 0 records
-	binary.Write(buf, binary.LittleEndian, uint16(32+32+1))
-	binary.Write(buf, binary.LittleEndian, uint16(11))
-	buf.Write(make([]byte, 20))
-
-	// field descriptor
-	buf.Write(make([]byte, 32))
-
-	// invalid terminator (should be 0x0D)
-	buf.WriteByte(0xFF)
+	writeHeader(buf, 0, 32+32+1, 1+10)
+	writeCharField(buf, "NAME", 10)
+	buf.WriteByte(0xFF) // should be 0x0D
 
 	_, err := New(bytes.NewReader(buf.Bytes()))
-	if err == nil {
-		t.Error("Expected error for invalid terminator, got nil")
+	if !errors.Is(err, ErrInvalidTerminator) {
+		t.Errorf("New() = %v, want ErrInvalidTerminator", err)
 	}
+}
+
+func TestHeaderTooSmallForTerminator(t *testing.T) {
+	buf := new(bytes.Buffer)
+	writeHeader(buf, 0, 32, 1+10)
+	writeCharField(buf, "NAME", 10)
+	buf.WriteByte(0x0D)
+
+	_, err := New(bytes.NewReader(buf.Bytes()))
+	if !errors.Is(err, ErrInvalidHeaderSize) {
+		t.Errorf("New() = %v, want ErrInvalidHeaderSize", err)
+	}
+}
+
+func TestFieldDescriptorExceedsHeader(t *testing.T) {
+	// header declares room for one descriptor without the terminator
+	buf := new(bytes.Buffer)
+	writeHeader(buf, 0, 32+32, 1+10)
+	writeCharField(buf, "NAME", 10)
+	buf.WriteByte(0x0D)
+
+	_, err := New(bytes.NewReader(buf.Bytes()))
+	if !errors.Is(err, ErrInvalidTerminator) {
+		t.Errorf("New() = %v, want ErrInvalidTerminator", err)
+	}
+}
+
+func TestZeroLengthFieldsOutsideHeader(t *testing.T) {
+	// 2048 zero-length descriptors after a header that declares no fields
+	buf := new(bytes.Buffer)
+	writeHeader(buf, 0, 33, 1)
+	buf.Write(make([]byte, 2048*32))
+	buf.WriteByte(0x0D)
+
+	r, err := New(bytes.NewReader(buf.Bytes()))
+	if !errors.Is(err, ErrInvalidTerminator) {
+		t.Errorf("New() = %v, want ErrInvalidTerminator", err)
+	}
+	if r != nil {
+		t.Errorf("New() returned reader with %d fields", r.FieldsCount())
+	}
+}
+
+// countingReader counts bytes read from the underlying reader.
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
+}
+
+func TestNewDoesNotReadPastHeader(t *testing.T) {
+	// a stream of descriptors without a terminator must not be consumed to EOF
+	const headerSize = 32 + 32 + 1
+	buf := new(bytes.Buffer)
+	writeHeader(buf, 0, headerSize, 1+10)
+	for buf.Len() < 1<<20 {
+		writeCharField(buf, "NAME", 10)
+	}
+
+	cr := &countingReader{r: bytes.NewReader(buf.Bytes())}
+	if _, err := New(cr); !errors.Is(err, ErrInvalidTerminator) {
+		t.Fatalf("New() = %v, want ErrInvalidTerminator", err)
+	}
+	// allow for bufio read-ahead
+	if limit := headerSize + 4096; cr.n > limit {
+		t.Errorf("New() read %d bytes, want <= %d", cr.n, limit)
+	}
+}
+
+func FuzzNew(f *testing.F) {
+	f.Add(createMinimalDBF())
+	f.Add(createDBFWithMultipleFields())
+	f.Add(createVFPDBFWithLongCharField(300))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 1<<16 {
+			return
+		}
+		r, err := New(bytes.NewReader(data), WithCP866())
+		if err != nil {
+			return
+		}
+		if max := (int(r.headerBytesNumber) - 33) / 32; r.FieldsCount() > max {
+			t.Fatalf("%d fields do not fit in %d-byte header", r.FieldsCount(), r.headerBytesNumber)
+		}
+		records, err := r.ReadAll()
+		if err == nil && uint32(len(records)) != r.RecordsCount() {
+			t.Fatalf("ReadAll() returned %d records without error, header declares %d", len(records), r.RecordsCount())
+		}
+	})
 }
 
 func TestEmptyFile(t *testing.T) {
@@ -631,8 +783,8 @@ func TestInvalidHeaderSize(t *testing.T) {
 	buf.Write(make([]byte, 20))
 
 	_, err := New(bytes.NewReader(buf.Bytes()), WithCP866())
-	if err == nil {
-		t.Error("Expected error for header size < 32, got nil")
+	if !errors.Is(err, ErrInvalidHeaderSize) {
+		t.Errorf("New() = %v, want ErrInvalidHeaderSize", err)
 	}
 }
 
@@ -859,11 +1011,74 @@ func TestHeaderPaddingSkip(t *testing.T) {
 	}
 }
 
+func TestStringFieldsCountWithPadding(t *testing.T) {
+	for _, padding := range []int{0, 10, 32, 263} {
+		buf := new(bytes.Buffer)
+		buf.WriteByte(0x03)
+		buf.WriteByte(124)
+		buf.WriteByte(1)
+		buf.WriteByte(15)
+		binary.Write(buf, binary.LittleEndian, uint32(0))
+		binary.Write(buf, binary.LittleEndian, uint16(32+32+1+padding))
+		binary.Write(buf, binary.LittleEndian, uint16(1+5))
+		reserved := make([]byte, 20)
+		reserved[17] = 0x26
+		buf.Write(reserved)
+
+		name := make([]byte, 11)
+		copy(name, "ID")
+		buf.Write(name)
+		buf.WriteByte('C')
+		buf.Write(make([]byte, 4))
+		buf.WriteByte(5)
+		buf.WriteByte(0)
+		buf.Write(make([]byte, 14))
+		buf.WriteByte(0x0D)
+		buf.Write(make([]byte, padding))
+
+		r, err := New(bytes.NewReader(buf.Bytes()))
+		if err != nil {
+			t.Fatalf("padding %d: New() failed: %v", padding, err)
+		}
+		if r.FieldsCount() != 1 {
+			t.Errorf("padding %d: FieldsCount() = %d, want 1", padding, r.FieldsCount())
+		}
+		if !strings.Contains(r.String(), "Fields Count: 1\n") {
+			t.Errorf("padding %d: String() reports wrong fields count:\n%s", padding, r.String())
+		}
+	}
+}
+
 func TestGetDecoderByLDID(t *testing.T) {
-	ldids := []byte{0x26, 0x64, 0x65, 0xC9, 0x03, 0x01, 0x02}
-	for _, ldid := range ldids {
-		if getDecoderByLDID(ldid) == nil {
-			t.Errorf("getDecoderByLDID(0x%02X) returned nil, want decoder", ldid)
+	tests := []struct {
+		ldid byte
+		cm   *charmap.Charmap
+		text string
+	}{
+		{0x26, charmap.CodePage866, "Привет"},
+		{0x65, charmap.CodePage866, "Привет"},
+		{0x64, charmap.CodePage852, "Łódź"},
+		{0xC9, charmap.Windows1251, "Привет"},
+		{0x03, charmap.Windows1252, "Café"},
+		{0x01, charmap.CodePage437, "Café"},
+		{0x02, charmap.CodePage850, "Café"},
+	}
+	for _, tt := range tests {
+		dec := getDecoderByLDID(tt.ldid)
+		if dec == nil {
+			t.Errorf("getDecoderByLDID(0x%02X) returned nil, want decoder", tt.ldid)
+			continue
+		}
+		encoded, err := tt.cm.NewEncoder().Bytes([]byte(tt.text))
+		if err != nil {
+			t.Fatalf("encode %q: %v", tt.text, err)
+		}
+		decoded, err := dec.Bytes(encoded)
+		if err != nil {
+			t.Fatalf("getDecoderByLDID(0x%02X) decode: %v", tt.ldid, err)
+		}
+		if string(decoded) != tt.text {
+			t.Errorf("getDecoderByLDID(0x%02X) decoded %q, want %q", tt.ldid, decoded, tt.text)
 		}
 	}
 	if getDecoderByLDID(0xFF) != nil {
@@ -907,8 +1122,8 @@ func createDBFWithLogicalAndFloat() []byte {
 		buf.WriteString(score)
 		buf.WriteString(note)
 	}
-	writeRecord(0x20, "T", "  3.14  ", "memo1     ")
-	writeRecord(0x20, "t", "  2.71  ", "memo2     ")
+	writeRecord(0x20, "T", "  3.14  ", "         1")
+	writeRecord(0x20, "t", "  2.71  ", "        42")
 	writeRecord(0x20, "Y", "  1.00  ", "          ")
 	writeRecord(0x20, "F", "  0.00  ", "          ")
 	writeRecord(0x20, "N", "  0.00  ", "          ")
@@ -955,34 +1170,57 @@ func TestDecodeFieldValueLogicalAndFloat(t *testing.T) {
 		t.Errorf("record[0] SCORE: expected \"3.14\", got %q", score)
 	}
 
-	// memo field returned as trimmed string
-	note := strings.TrimSpace(records[0].Data["NOTE"])
-	if note != "memo1" {
-		t.Errorf("record[0] NOTE: expected \"memo1\", got %q", note)
+	// memo field holds the block number in the memo file
+	if note := records[0].Data["NOTE"]; note != "1" {
+		t.Errorf("record[0] NOTE: expected block number \"1\", got %q", note)
 	}
 }
 
 func TestNewFromFileNotFound(t *testing.T) {
-	_, err := NewFromFile("/nonexistent/path/file.dbf", WithCP866())
-	if err == nil {
-		t.Error("Expected error for non-existent file, got nil")
+	_, err := NewFromFile(filepath.Join(t.TempDir(), "missing.dbf"), WithCP866())
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("NewFromFile() = %v, want fs.ErrNotExist", err)
 	}
 }
 
+// writeTempDBF writes data to a file in a temporary directory and returns its path.
+func writeTempDBF(t *testing.T, data []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "test.dbf")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+	return path
+}
+
 func TestNewFromFileAndClose(t *testing.T) {
-	r, err := NewFromFile("test.dbf", WithCP866())
+	r, err := NewFromFile(writeTempDBF(t, createMinimalDBF()), WithCP866())
 	if err != nil {
-		t.Skip("test.dbf not available:", err)
+		t.Fatalf("NewFromFile() failed: %v", err)
+	}
+	records, err := r.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll() failed: %v", err)
+	}
+	if len(records) != 2 || records[0].Data["NAME"] != "John Doe" {
+		t.Errorf("ReadAll() returned unexpected records: %d", len(records))
 	}
 	if err := r.Close(); err != nil {
 		t.Errorf("Close() returned error: %v", err)
 	}
 }
 
+func TestNewFromFileInvalid(t *testing.T) {
+	_, err := NewFromFile(writeTempDBF(t, []byte{0xFF}), WithCP866())
+	if !errors.Is(err, ErrInvalidFileType) {
+		t.Errorf("NewFromFile() = %v, want ErrInvalidFileType", err)
+	}
+}
+
 func TestCloseIdempotent(t *testing.T) {
-	r, err := NewFromFile("test.dbf", WithCP866())
+	r, err := NewFromFile(writeTempDBF(t, createMinimalDBF()), WithCP866())
 	if err != nil {
-		t.Skip("test.dbf not available:", err)
+		t.Fatalf("NewFromFile() failed: %v", err)
 	}
 	if err := r.Close(); err != nil {
 		t.Fatalf("first Close() error: %v", err)
@@ -1003,21 +1241,142 @@ func TestCloseWithoutFile(t *testing.T) {
 	}
 }
 
-func TestErrAfterIOEOF(t *testing.T) {
+func TestErrAfterTruncation(t *testing.T) {
 	data := createMinimalDBF()
-	// truncate one record to force io.EOF mid-read
-	truncated := data[:len(data)-5]
-	r, err := New(bytes.NewReader(truncated), WithCP866())
+	tests := []struct {
+		name    string
+		cut     int // bytes removed from the end
+		wantErr error
+	}{
+		{"inside record", 5, io.ErrUnexpectedEOF},
+		{"at record boundary", 11, io.EOF},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, err := New(bytes.NewReader(data[:len(data)-tt.cut]), WithCP866())
+			if err != nil {
+				t.Fatalf("New() failed: %v", err)
+			}
+			count := 0
+			for r.Next() {
+				if _, err := r.Read(); err != nil {
+					t.Fatalf("Read() failed: %v", err)
+				}
+				count++
+			}
+			if count != 1 {
+				t.Errorf("read %d records, want 1", count)
+			}
+			err = r.Err()
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("Err() = %v, want wrapped %v", err, tt.wantErr)
+			}
+			if err == tt.wantErr {
+				t.Error("Err() must wrap the I/O error with context")
+			}
+			if _, err := r.Read(); err == nil {
+				t.Error("Read() after failed Next() should return an error")
+			}
+		})
+	}
+}
+
+func TestNextTwiceSkipsRecord(t *testing.T) {
+	r, err := New(bytes.NewReader(createMinimalDBF()), WithCP866())
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
-	// exhaust records — second Read will hit EOF
-	for r.Next() {
-		r.Read() //nolint
+	if !r.Next() || !r.Next() {
+		t.Fatal("Next() returned false")
 	}
-	// err() must not expose io.EOF
-	if err := r.Err(); err != nil && err.Error() == "EOF" {
-		t.Error("Err() must not return raw io.EOF")
+	record, err := r.Read()
+	if err != nil {
+		t.Fatalf("Read() failed: %v", err)
+	}
+	if got := record.Data["NAME"]; got != "Jane Smith" {
+		t.Errorf("Read() after two Next() = %q, want %q", got, "Jane Smith")
+	}
+	if r.Next() {
+		t.Error("Next() should return false after the last record")
+	}
+	if _, err := r.Read(); !errors.Is(err, ErrReadBeforeNext) {
+		t.Errorf("Read() after Next() returned false: got %v, want ErrReadBeforeNext", err)
+	}
+	if err := r.Err(); err != nil {
+		t.Errorf("Err() = %v, want nil", err)
+	}
+}
+
+func TestReadTwiceAfterNext(t *testing.T) {
+	r, err := New(bytes.NewReader(createMinimalDBF()), WithCP866())
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	if !r.Next() {
+		t.Fatal("Next() returned false")
+	}
+	if _, err := r.Read(); err != nil {
+		t.Fatalf("Read() failed: %v", err)
+	}
+	if _, err := r.Read(); !errors.Is(err, ErrReadBeforeNext) {
+		t.Errorf("second Read() = %v, want ErrReadBeforeNext", err)
+	}
+}
+
+func TestReadAllAfterNext(t *testing.T) {
+	r, err := New(bytes.NewReader(createMinimalDBF()), WithCP866())
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	if !r.Next() {
+		t.Fatal("Next() returned false")
+	}
+	records, err := r.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll() failed: %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("ReadAll() returned %d records, want 2", len(records))
+	}
+	if records[0].Data["NAME"] != "John Doe" || records[1].Data["NAME"] != "Jane Smith" {
+		t.Errorf("ReadAll() returned wrong records: %v, %v", records[0].Data, records[1].Data)
+	}
+}
+
+func TestReadAllAfterRead(t *testing.T) {
+	r, err := New(bytes.NewReader(createMinimalDBF()), WithCP866())
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	if !r.Next() {
+		t.Fatal("Next() returned false")
+	}
+	if _, err := r.Read(); err != nil {
+		t.Fatalf("Read() failed: %v", err)
+	}
+	records, err := r.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll() failed: %v", err)
+	}
+	if len(records) != 1 || records[0].Data["NAME"] != "Jane Smith" {
+		t.Errorf("ReadAll() after Read() = %d records, want only Jane Smith", len(records))
+	}
+}
+
+func TestNextWithoutReadNoError(t *testing.T) {
+	r, err := New(bytes.NewReader(createMinimalDBF()), WithCP866())
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	count := 0
+	for r.Next() {
+		count++
+	}
+	if count != 2 {
+		t.Errorf("Next() returned true %d times, want 2", count)
+	}
+	if err := r.Err(); err != nil {
+		t.Errorf("Err() = %v, want nil", err)
 	}
 }
 
@@ -1104,5 +1463,379 @@ func BenchmarkNextRead(b *testing.B) {
 				b.Fatal(err)
 			}
 		}
+	}
+}
+
+type testField struct {
+	name   string
+	typ    byte
+	length byte
+	flags  byte
+}
+
+// buildDBF builds a DBF of the given file type with CP1251 LDID.
+// Each record is the field data without the deletion flag.
+func buildDBF(fileType byte, fields []testField, records ...[]byte) []byte {
+	recordSize := 1
+	for _, f := range fields {
+		recordSize += int(f.length)
+	}
+	buf := new(bytes.Buffer)
+	buf.WriteByte(fileType)
+	buf.Write([]byte{124, 1, 15})
+	binary.Write(buf, binary.LittleEndian, uint32(len(records)))
+	binary.Write(buf, binary.LittleEndian, uint16(32+32*len(fields)+1))
+	binary.Write(buf, binary.LittleEndian, uint16(recordSize))
+	reserved := make([]byte, 20)
+	reserved[17] = 0xC9
+	buf.Write(reserved)
+	for _, f := range fields {
+		b := make([]byte, 32)
+		copy(b, f.name)
+		b[11] = f.typ
+		b[16] = f.length
+		b[18] = f.flags
+		buf.Write(b)
+	}
+	buf.WriteByte(0x0D)
+	for _, rec := range records {
+		buf.WriteByte(0x20)
+		buf.Write(rec)
+	}
+	return buf.Bytes()
+}
+
+func le32(v uint32) []byte { return binary.LittleEndian.AppendUint32(nil, v) }
+func le64(v uint64) []byte { return binary.LittleEndian.AppendUint64(nil, v) }
+
+func readAllData(t *testing.T, data []byte) []map[string]string {
+	t.Helper()
+	r, err := New(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	records, err := r.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll() failed: %v", err)
+	}
+	result := make([]map[string]string, len(records))
+	for i, rec := range records {
+		result[i] = rec.Data
+	}
+	return result
+}
+
+func TestVFPBinaryTypes(t *testing.T) {
+	fields := []testField{
+		{"INT", 'I', 4, 0},
+		{"DBL", 'B', 8, 0},
+		{"CUR", 'Y', 8, 0},
+		{"DT", 'T', 8, 0},
+		{"MEMO", 'M', 4, 0},
+	}
+	// 2024-01-15 10:30:00, stored 1 ms early as VFP sometimes does
+	jd := uint32(julianDayUnixEpoch + time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC).Unix()/86400)
+	ms := uint32((10*3600+30*60)*1000 - 1)
+
+	rec1 := slices.Concat(le32(42), le64(math.Float64bits(3.14)), le64(123456), le32(jd), le32(ms), le32(7))
+	minusFive := int64(-5)
+	rec2 := slices.Concat(le32(0xFFFFFFFF), le64(math.Float64bits(-0.5)), le64(uint64(minusFive)), make([]byte, 8), le32(0))
+
+	got := readAllData(t, buildDBF(0x30, fields, rec1, rec2))
+	want := []map[string]string{
+		{"INT": "42", "DBL": "3.14", "CUR": "12.3456", "DT": "2024-01-15T10:30:00", "MEMO": "7"},
+		{"INT": "-1", "DBL": "-0.5", "CUR": "-0.0005", "DT": "", "MEMO": ""},
+	}
+	for i := range want {
+		if !maps.Equal(got[i], want[i]) {
+			t.Errorf("record %d = %v, want %v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestVFPBinaryTypesInvalidLength(t *testing.T) {
+	for _, typ := range []byte{'I', 'B', 'Y', 'T', 'M'} {
+		t.Run(string(typ), func(t *testing.T) {
+			data := buildDBF(0x30, []testField{{"X", typ, 3, 0}}, []byte{1, 2, 3})
+			r, err := New(bytes.NewReader(data))
+			if err != nil {
+				t.Fatalf("New() failed: %v", err)
+			}
+			if _, err := r.ReadAll(); err == nil || !strings.Contains(err.Error(), "field X") {
+				t.Errorf("ReadAll() = %v, want field length error", err)
+			}
+		})
+	}
+}
+
+func TestVFPBinaryVarlength(t *testing.T) {
+	fields := []testField{
+		{"VB", 'V', 4, flagBinary},
+		{"Q", 'Q', 4, 0},
+		{"_NullFlags", '0', 1, flagSystem},
+	}
+	// both values shorter than the field: var-length bits 0 and 1
+	rec := []byte{0xCF, 0x00, 0, 2, 0xFF, 0, 0, 1, 0x03}
+	got := readAllData(t, buildDBF(0x32, fields, rec))
+	want := map[string]string{"VB": "\xCF\x00", "Q": "\xFF"}
+	if !maps.Equal(got[0], want) {
+		t.Errorf("Data = %q, want %q", got[0], want)
+	}
+}
+
+func TestVFPNullFlagsAndVarchar(t *testing.T) {
+	// bits: NUM null=0; NAME varlength=1, null=2
+	fields := []testField{
+		{"NUM", 'I', 4, flagNullable},
+		{"NAME", 'V', 10, flagNullable},
+		{"_NullFlags", '0', 1, flagSystem},
+	}
+	name, _ := charmap.Windows1251.NewEncoder().Bytes([]byte("Иван"))
+	short := make([]byte, 10)
+	copy(short, name)
+	short[9] = byte(len(name))
+
+	rec1 := slices.Concat(le32(5), short, []byte{0x02})
+	rec2 := slices.Concat(le32(0), make([]byte, 10), []byte{0x05})
+	rec3 := slices.Concat(le32(1), []byte("0123456789"), []byte{0x00})
+
+	// empty, not null
+	rec4 := slices.Concat(le32(0), []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, []byte{0x02})
+
+	r, err := New(bytes.NewReader(buildDBF(0x32, fields, rec1, rec2, rec3, rec4)))
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	records, err := r.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll() failed: %v", err)
+	}
+	want := []struct {
+		data map[string]string
+		null map[string]bool
+	}{
+		{map[string]string{"NUM": "5", "NAME": "Иван"}, nil},
+		{map[string]string{"NUM": "", "NAME": ""}, map[string]bool{"NUM": true, "NAME": true}},
+		{map[string]string{"NUM": "1", "NAME": "0123456789"}, nil},
+		{map[string]string{"NUM": "0", "NAME": ""}, nil},
+	}
+	for i, w := range want {
+		if !maps.Equal(records[i].Data, w.data) {
+			t.Errorf("record %d Data = %q, want %q", i, records[i].Data, w.data)
+		}
+		if !maps.Equal(records[i].Null, w.null) {
+			t.Errorf("record %d Null = %v, want %v", i, records[i].Null, w.null)
+		}
+	}
+}
+
+func TestVFPVarcharInvalidLength(t *testing.T) {
+	fields := []testField{
+		{"NAME", 'V', 4, 0},
+		{"_NullFlags", '0', 1, flagSystem},
+	}
+	data := buildDBF(0x32, fields, []byte{'a', 'b', 'c', 9, 0x01})
+	r, err := New(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	if _, err := r.ReadAll(); !errors.Is(err, ErrFieldOutOfBounds) {
+		t.Errorf("ReadAll() = %v, want ErrFieldOutOfBounds", err)
+	}
+}
+
+func TestVFPBinaryCharacter(t *testing.T) {
+	fields := []testField{{"RAW", 'C', 4, flagBinary}, {"TXT", 'C', 4, 0}}
+	got := readAllData(t, buildDBF(0x30, fields, []byte{0x00, 0xCF, ' ', ' ', 0xCF, ' ', ' ', ' '}))
+	if got[0]["RAW"] != "\x00\xCF  " {
+		t.Errorf("RAW = %q, want raw bytes", got[0]["RAW"])
+	}
+	if got[0]["TXT"] != "П" {
+		t.Errorf("TXT = %q, want %q", got[0]["TXT"], "П")
+	}
+}
+
+func TestDBaseMemoReference(t *testing.T) {
+	fields := []testField{{"NOTES", 'M', 10, 0}}
+	got := readAllData(t, buildDBF(0x83, fields, []byte("        12")))
+	if got[0]["NOTES"] != "12" {
+		t.Errorf("NOTES = %q, want %q", got[0]["NOTES"], "12")
+	}
+}
+
+func TestUnsupportedFieldType(t *testing.T) {
+	tests := []struct {
+		name     string
+		fileType byte
+		typ      byte
+	}{
+		{"unknown type", 0x03, '@'},
+		{"VFP integer in dBase file", 0x03, 'I'},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := buildDBF(tt.fileType, []testField{{"X", tt.typ, 4, 0}}, []byte{1, 2, 3, 4})
+			r, err := New(bytes.NewReader(data))
+			if err != nil {
+				t.Fatalf("New() failed: %v", err)
+			}
+			if !r.Next() {
+				t.Fatalf("Next() returned false: %v", r.Err())
+			}
+			if _, err := r.Read(); !errors.Is(err, ErrUnsupportedType) {
+				t.Errorf("Read() = %v, want ErrUnsupportedType", err)
+			}
+		})
+	}
+}
+
+func TestReadAllPendingRecordError(t *testing.T) {
+	data := buildDBF(0x03, []testField{{"X", '@', 1, 0}}, []byte{1})
+	r, err := New(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	if !r.Next() {
+		t.Fatalf("Next() returned false: %v", r.Err())
+	}
+	records, err := r.ReadAll()
+	if !errors.Is(err, ErrUnsupportedType) {
+		t.Errorf("ReadAll() = %v, want ErrUnsupportedType", err)
+	}
+	if len(records) != 0 {
+		t.Errorf("ReadAll() returned %d records, want 0", len(records))
+	}
+}
+
+func TestDeletionFlag(t *testing.T) {
+	fields := []testField{{"X", 'C', 1, 0}}
+	build := func(flags ...byte) []byte {
+		records := make([][]byte, len(flags))
+		for i := range flags {
+			records[i] = []byte{'A' + byte(i)}
+		}
+		data := buildDBF(0x03, fields, records...)
+		recordsStart := len(data) - 2*len(flags)
+		for i, f := range flags {
+			data[recordsStart+2*i] = f
+		}
+		return data
+	}
+
+	tests := []struct {
+		name    string
+		data    []byte
+		opts    []Option
+		count   int
+		wantErr error
+	}{
+		{"active and deleted", build(0x20, 0x2A), nil, 2, nil},
+		{"strict active and deleted", build(0x20, 0x2A), []Option{WithStrict()}, 2, nil},
+		{"lenient unknown flag", build(0x00, 0xFF), nil, 2, nil},
+		{"strict zero flag", build(0x20, 0x00), []Option{WithStrict()}, 1, ErrInvalidDeletionFlag},
+		{"strict 0xFF flag", build(0xFF, 0x20), []Option{WithStrict()}, 0, ErrInvalidDeletionFlag},
+		{"EOF marker before last record", build(0x20, 0x1A), nil, 1, io.ErrUnexpectedEOF},
+		{"strict EOF marker", build(0x1A, 0x20), []Option{WithStrict()}, 0, io.ErrUnexpectedEOF},
+		{"EOF marker after last record", append(build(0x20, 0x2A), 0x1A), nil, 2, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, err := New(bytes.NewReader(tt.data), tt.opts...)
+			if err != nil {
+				t.Fatalf("New() failed: %v", err)
+			}
+			records, err := r.ReadAll()
+			if len(records) != tt.count {
+				t.Errorf("ReadAll() returned %d records, want %d", len(records), tt.count)
+			}
+			if tt.wantErr == nil && err != nil {
+				t.Errorf("ReadAll() = %v, want nil", err)
+			}
+			if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
+				t.Errorf("ReadAll() = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestFieldNames(t *testing.T) {
+	t.Run("garbage after NUL", func(t *testing.T) {
+		data := buildDBF(0x03, []testField{{"NAME\x00junk", 'C', 1, 0}}, []byte("A"))
+		got := readAllData(t, data)
+		if !maps.Equal(got[0], map[string]string{"NAME": "A"}) {
+			t.Errorf("Data = %q, want NAME key", got[0])
+		}
+	})
+	t.Run("max length", func(t *testing.T) {
+		data := buildDBF(0x03, []testField{{"ABCDEFGHIJK", 'C', 1, 0}}, []byte("A"))
+		got := readAllData(t, data)
+		if got[0]["ABCDEFGHIJK"] != "A" {
+			t.Errorf("Data = %q, want 11-character name", got[0])
+		}
+	})
+
+	tests := []struct {
+		name   string
+		fields []testField
+	}{
+		{"duplicate", []testField{{"X", 'C', 1, 0}, {"X", 'C', 1, 0}}},
+		{"duplicate after NUL", []testField{{"X", 'C', 1, 0}, {"X\x00Y", 'C', 1, 0}}},
+		{"empty", []testField{{"", 'C', 1, 0}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := New(bytes.NewReader(buildDBF(0x03, tt.fields)))
+			if !errors.Is(err, ErrInvalidFieldName) {
+				t.Errorf("New() = %v, want ErrInvalidFieldName", err)
+			}
+		})
+	}
+}
+
+var errBadByte = errors.New("bad byte")
+
+// failingTransformer copies its input but fails on 0xFF.
+type failingTransformer struct{ transform.NopResetter }
+
+func (failingTransformer) Transform(dst, src []byte, atEOF bool) (int, int, error) {
+	if i := bytes.IndexByte(src, 0xFF); i >= 0 {
+		return 0, 0, errBadByte
+	}
+	n := copy(dst, src)
+	if n < len(src) {
+		return n, n, transform.ErrShortDst
+	}
+	return n, n, nil
+}
+
+func TestDecoderErrors(t *testing.T) {
+	withFailing := WithDecoder(&encoding.Decoder{Transformer: failingTransformer{}})
+
+	t.Run("field name", func(t *testing.T) {
+		data := buildDBF(0x03, []testField{{"X\xFF", 'C', 1, 0}})
+		if _, err := New(bytes.NewReader(data), withFailing); !errors.Is(err, errBadByte) {
+			t.Errorf("New() = %v, want errBadByte", err)
+		}
+	})
+
+	for _, typ := range []byte{'C', 'V'} {
+		t.Run("field value "+string(typ), func(t *testing.T) {
+			fields := []testField{{"X", typ, 1, 0}}
+			data := buildDBF(0x32, fields, []byte("A"), []byte{0xFF}, []byte("B"))
+			r, err := New(bytes.NewReader(data), withFailing)
+			if err != nil {
+				t.Fatalf("New() failed: %v", err)
+			}
+			records, err := r.ReadAll()
+			if !errors.Is(err, errBadByte) {
+				t.Errorf("ReadAll() = %v, want errBadByte", err)
+			}
+			if !errors.Is(r.Err(), errBadByte) {
+				t.Errorf("Err() = %v, want errBadByte", r.Err())
+			}
+			if len(records) != 1 || records[0].Data["X"] != "A" {
+				t.Errorf("ReadAll() returned %d records, want the one before the failure", len(records))
+			}
+		})
 	}
 }
