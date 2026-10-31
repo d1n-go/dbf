@@ -229,6 +229,9 @@ type Option func(*Reader)
 // WithDecoder sets a custom text encoding decoder for reading character fields.
 // This is the most flexible option, allowing any encoding.Decoder to be used.
 // A nil decoder is ignored; pass WithEncoding or WithCP* to set encoding explicitly.
+//
+// Errors returned by the decoder are not hidden: a failure on a field name
+// is returned by New, and a failure on a field value by Read (and Err).
 func WithDecoder(decoder *encoding.Decoder) Option {
 	return func(r *Reader) {
 		if decoder != nil {
@@ -554,8 +557,7 @@ func (r *Reader) readField() (Field, error) {
 	}
 	decodedName, err := r.decoder.Bytes(nameBytes)
 	if err != nil {
-		// if decoding fails, use the raw bytes
-		decodedName = nameBytes
+		return Field{}, fmt.Errorf("decode name: %w", err)
 	}
 
 	fieldType := fieldBytes[11]
@@ -878,7 +880,7 @@ func (r *Reader) decodeFieldValue(field Field, data []byte) (string, error) {
 			}
 			decoded, err := r.decoder.Bytes(data)
 			if err != nil {
-				return string(data), nil
+				return "", err
 			}
 			return string(decoded), nil
 
@@ -891,7 +893,7 @@ func (r *Reader) decodeFieldValue(field Field, data []byte) (string, error) {
 	case 'C': // character field: decode to UTF-8 first, then trim spaces
 		decoded, err := r.decoder.Bytes(data)
 		if err != nil {
-			return strings.TrimSpace(string(data)), nil
+			return "", err
 		}
 		return strings.TrimSpace(string(decoded)), nil
 

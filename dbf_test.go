@@ -12,7 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/charmap"
+	"golang.org/x/text/transform"
 )
 
 // createMinimalDBF creates a minimal valid DBF file for testing
@@ -1701,6 +1703,54 @@ func TestFieldNames(t *testing.T) {
 			_, err := New(bytes.NewReader(buildDBF(0x03, tt.fields)))
 			if !errors.Is(err, ErrInvalidFieldName) {
 				t.Errorf("New() = %v, want ErrInvalidFieldName", err)
+			}
+		})
+	}
+}
+
+var errBadByte = errors.New("bad byte")
+
+// failingTransformer copies its input but fails on 0xFF.
+type failingTransformer struct{ transform.NopResetter }
+
+func (failingTransformer) Transform(dst, src []byte, atEOF bool) (int, int, error) {
+	if i := bytes.IndexByte(src, 0xFF); i >= 0 {
+		return 0, 0, errBadByte
+	}
+	n := copy(dst, src)
+	if n < len(src) {
+		return n, n, transform.ErrShortDst
+	}
+	return n, n, nil
+}
+
+func TestDecoderErrors(t *testing.T) {
+	withFailing := WithDecoder(&encoding.Decoder{Transformer: failingTransformer{}})
+
+	t.Run("field name", func(t *testing.T) {
+		data := buildDBF(0x03, []testField{{"X\xFF", 'C', 1, 0}})
+		if _, err := New(bytes.NewReader(data), withFailing); !errors.Is(err, errBadByte) {
+			t.Errorf("New() = %v, want errBadByte", err)
+		}
+	})
+
+	for _, typ := range []byte{'C', 'V'} {
+		t.Run("field value "+string(typ), func(t *testing.T) {
+			fields := []testField{{"X", typ, 1, 0}}
+			data := buildDBF(0x32, fields, []byte("A"), []byte{0xFF}, []byte("B"))
+			r, err := New(bytes.NewReader(data), withFailing)
+			if err != nil {
+				t.Fatalf("New() failed: %v", err)
+			}
+			records, err := r.ReadAll()
+			if !errors.Is(err, errBadByte) {
+				t.Errorf("ReadAll() = %v, want errBadByte", err)
+			}
+			if !errors.Is(r.Err(), errBadByte) {
+				t.Errorf("Err() = %v, want errBadByte", r.Err())
+			}
+			if len(records) != 1 || records[0].Data["X"] != "A" {
+				t.Errorf("ReadAll() returned %d records, want the one before the failure", len(records))
 			}
 		})
 	}
